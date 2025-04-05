@@ -26,7 +26,7 @@ CPU、内存、IO三者之间的速度差异很大，为了平衡，做了以下
 
 ## 缓存导致的可见性问题
 
-一个线程对共享变量的修改，另外一个线程能够马上看到，这就是可见性。![image-20250405163509470](C:\Users\24484\AppData\Roaming\Typora\typora-user-images\image-20250405163509470.png)
+一个线程对共享变量的修改，另外一个线程能够马上看到，这就是可见性。![image-20250405163509470](D:\code\ConcurrencyAction\notes\image\image-20250405163509470.png)
 
 CPU缓存 和 内存中的值可能不是时刻一致的。
 
@@ -43,7 +43,7 @@ CPU缓存 和 内存中的值可能不是时刻一致的。
 
 比如一个 count+=1 的语句，底层实际是三条机器指令：变量加载到CPU寄存器、寄存器数值加一、写入内存或CPU缓存。
 
-![image-20250405164430765](C:\Users\24484\AppData\Roaming\Typora\typora-user-images\image-20250405164430765.png)
+![image-20250405164430765](D:\code\ConcurrencyAction\notes\image\image-20250405164430765.png)
 
 把一个或者多个操作，在CPU执行过程中不被中断的特性叫做原子性。CPU能保证的原子操作是CPU指令级别的，与高级语言的一条指令并不一一对应，需要注意。（注意下，在32位机器上对long double变量进行加减操作有并发隐患）
 
@@ -72,5 +72,80 @@ CPU缓存 和 内存中的值可能不是时刻一致的。
 
 第2 3 步可能因为优化导致顺序颠倒，可能导致空指针异常。
 
-![image-20250405170248684](C:\Users\24484\AppData\Roaming\Typora\typora-user-images\image-20250405170248684.png)
+![image-20250405170248684](D:\code\ConcurrencyAction\notes\image\image-20250405170248684.png)
+
+# Java内存模型
+
+解决可见性 + 有序性。
+
+## 什么是？
+
+为了兼具 性能 与正确性，需要做到按需禁用缓存 和 编译优化，提供给程序员手段。具体方法包括volatile、Synchronized、final、happens-before
+
+### volatile
+
+禁用cpu缓存，必须从内存中读取或者写入。
+
+### happens-before
+
+表达了前面一个操作的结果对后续操作是可见的，约束了编译器的优化行为。
+
+1. 程序的顺序性规则：在一个线程中，前面代码的操作happens before后面的代码操作。
+2. volatile变量规则：对一个volatile变量的写操作，happens before于后续对这个volatile变量的读操作。
+3. 传递性：A happens before B、B  happens before C=> A happens before C。举个例子：![image-20250405201423499](D:\code\ConcurrencyAction\notes\image\image-20250405201423499.png)
+
+- x=42 happens before v== true
+- 写v==true hb 读v==true
+- x == 42 hb 读变量X
+
+4. 管程中锁的规则：对一个锁的解锁happens before于后续对这个锁的加锁。
+
+5. 线程start规则：线程A启动子线程B后，B能看到线程A在启动子线程B前的操作。
+
+   ```java
+   Thread B = new Thread(()->{
+     // 主线程调用B.start()之前
+     // 所有对共享变量的修改，此处皆可见
+     // 此例中，var==77
+   });
+   // 此处对共享变量var修改
+   var = 77;
+   // 主线程启动子线程
+   B.start();
+   ```
+
+6. 线程join规则，A等待B执行完成，则A线程能看到线程B中的操作。
+
+```java
+Thread B = new Thread(()->{
+  // 此处对共享变量var修改
+  var = 66;
+});
+// 例如此处对共享变量修改，
+// 则这个修改结果对线程B可见
+// 主线程启动子线程
+B.start();
+B.join()
+// 子线程所有对共享变量的修改
+// 在主线程调用B.join()之后皆可见
+// 此例中，var==66
+```
+
+### final
+
+final就表示了这个变量生而不变，可以使劲优化。后面对final类型变量的重排进行了约束，只要构造函数没有逸出，就没有问题。
+
+```java
+// 错误的构造函数, 线程通过global.obj读取x是有可能读到0的
+public FinalFieldExample() { 
+  x = 3;
+  y = 4;
+  // 此处就是讲this逸出，
+  global.obj = this;
+}
+```
+
+
+
+# 互斥锁： 解决原子性问题
 

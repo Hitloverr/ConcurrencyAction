@@ -149,3 +149,134 @@ public FinalFieldExample() {
 
 # 互斥锁： 解决原子性问题
 
+eg：long型变量是64位，在32位cpu上执行写操作会拆分成两次写操作。如果两个线程在不同的CPU核心中同时写long变量高32位的话，就会出现bug了：重新读出来却不是自己写出的。
+
+
+
+原子性：一个或者多个操作在CPU执行的过程中不被中断。**本质是要保证中间状态不对外可见**。不能直接禁用线程切换，那就效率太低下了。（这种情况就是互斥，同一时刻只有一个线程执行）
+
+## 锁模型
+
+确定要锁定的对象，锁要保护的资源以及在哪里加锁解锁。
+
+![image-20250406173122725](D:\code\ConcurrencyAction\notes\image\image-20250406173122725.png)
+
+![image-20250406173231885](D:\code\ConcurrencyAction\notes\image\image-20250406173231885.png)
+
+首先，标注临界区要保护的资源R；其次，要保护资源R就得为它创建锁LR；最后，需要在进出临界区时添加加锁操作和解锁操作。
+
+
+
+Java中的锁：Synchronized
+
+```java
+class X {
+  // 修饰非静态方法
+  synchronized void foo() {
+    // 临界区
+  }
+  // 修饰静态方法
+  synchronized static void bar() {
+    // 临界区
+  }
+  // 修饰代码块
+  Object obj = new Object()；
+  void baz() {
+    synchronized(obj) {
+      // 临界区
+    }
+  }
+}  
+```
+
+> 修饰静态方式：锁的是当前类的Class对象；修饰非静态方法，锁的是当前实例对象this
+
+解决count+=1的问题：根据happens-before传递性规则，前一个线程在临界区
+
+修改的共享变量（解锁之前），对后续进入临界区（加锁之后）的线程是可见的。当然，为了保证可见性，在get方法那里也要加上锁。
+
+```java
+class SafeCalc {
+  long value = 0L;
+  synchronized long get() {
+    return value;
+  }
+  synchronized void addOne() {
+    value += 1;
+  }
+}
+```
+
+![image-20250406174443262](D:\code\ConcurrencyAction\notes\image\image-20250406174443262.png)
+
+一把锁可以锁上多个受保护资源，如果并发操作用的是不同的锁，那是做不到线程安全的。![image-20250406174755448](D:\code\ConcurrencyAction\notes\image\image-20250406174755448.png)
+
+## 保护没有关联关系的多个资源
+
+比如一个账户下的属性有 密码、账户余额。这两个属性的修改与查看可以用同一把锁，但是性能太差：取款、查看余额、修改密码、查看密码都要是串行的。 最好，是用不同的锁对受保护的资源进行精细化管理，提升性能。就是**细粒度锁**。
+
+## 保护有关联关系的多个资源
+
+比如账户转账
+
+```java
+class Account {
+  private int balance;
+  // 转账
+  synchronized void transfer(Account target, int amt){
+    if (this.balance > amt) {
+      this.balance -= amt;
+      target.balance += amt;
+    }
+  } 
+}
+```
+
+临界区有两个资源：转出账户的余额this.balance 和 转入账户的余额target.balance。问题出在this这把锁，因为保护不了别人的余额target.balance。
+
+比如：账户A往账户B转账，账户B往账户C转账，两个线程可以同时进入临界区，就会造成写覆盖，有一方的写入丢失了。
+
+## 使用锁的正确姿势
+
+要让锁能覆盖所有受保护资源，上面的例子可以这样写：(创建Account对象时，传入相同的lock，但是这种方式缺乏实践性，需要写代码的时候做好保障。)
+
+```java
+class Account {
+  private Object lock；
+  private int balance;
+  private Account();
+  // 创建Account时传入同一个lock对象
+  public Account(Object lock) {
+    this.lock = lock;
+  } 
+  // 转账
+  void transfer(Account target, int amt){
+    // 此处检查所有对象共享的锁
+    synchronized(lock) {
+      if (this.balance > amt) {
+        this.balance -= amt;
+        target.balance += amt;
+      }
+    }
+  }
+}
+```
+
+用类对象就好了~都是共享的
+
+```java
+class Account {
+  private int balance;
+  // 转账
+  void transfer(Account target, int amt){
+    synchronized(Account.class) {
+      if (this.balance > amt) {
+        this.balance -= amt;
+        target.balance += amt;
+      }
+    }
+  } 
+}
+```
+
+![image-20250406180215590](D:\code\ConcurrencyAction\notes\image\image-20250406180215590.png)

@@ -26,7 +26,7 @@ CPU、内存、IO三者之间的速度差异很大，为了平衡，做了以下
 
 ## 缓存导致的可见性问题
 
-一个线程对共享变量的修改，另外一个线程能够马上看到，这就是可见性。![image-20250405163509470](D:\code\ConcurrencyAction\notes\image\image-20250405163509470.png)
+一个线程对共享变量的修改，另外一个线程能够马上看到，这就是可见性。![image-20250405163509470](image\image-20250405163509470.png)
 
 CPU缓存 和 内存中的值可能不是时刻一致的。
 
@@ -43,7 +43,7 @@ CPU缓存 和 内存中的值可能不是时刻一致的。
 
 比如一个 count+=1 的语句，底层实际是三条机器指令：变量加载到CPU寄存器、寄存器数值加一、写入内存或CPU缓存。
 
-![image-20250405164430765](D:\code\ConcurrencyAction\notes\image\image-20250405164430765.png)
+![image-20250405164430765](image\image-20250405164430765.png)
 
 把一个或者多个操作，在CPU执行过程中不被中断的特性叫做原子性。CPU能保证的原子操作是CPU指令级别的，与高级语言的一条指令并不一一对应，需要注意。（注意下，在32位机器上对long double变量进行加减操作有并发隐患）
 
@@ -92,7 +92,7 @@ CPU缓存 和 内存中的值可能不是时刻一致的。
 
 1. 程序的顺序性规则：在一个线程中，前面代码的操作happens before后面的代码操作。
 2. volatile变量规则：对一个volatile变量的写操作，happens before于后续对这个volatile变量的读操作。
-3. 传递性：A happens before B、B  happens before C=> A happens before C。举个例子：![image-20250405201423499](D:\code\ConcurrencyAction\notes\image\image-20250405201423499.png)
+3. 传递性：A happens before B、B  happens before C=> A happens before C。举个例子：![image-20250405201423499](image\image-20250405201423499.png)
 
 - x=42 happens before v== true
 - 写v==true hb 读v==true
@@ -159,9 +159,9 @@ eg：long型变量是64位，在32位cpu上执行写操作会拆分成两次写�
 
 确定要锁定的对象，锁要保护的资源以及在哪里加锁解锁。
 
-![image-20250406173122725](D:\code\ConcurrencyAction\notes\image\image-20250406173122725.png)
+![image-20250406173122725](image\image-20250406173122725.png)
 
-![image-20250406173231885](D:\code\ConcurrencyAction\notes\image\image-20250406173231885.png)
+![image-20250406173231885](image\image-20250406173231885.png)
 
 首先，标注临界区要保护的资源R；其次，要保护资源R就得为它创建锁LR；最后，需要在进出临界区时添加加锁操作和解锁操作。
 
@@ -207,9 +207,9 @@ class SafeCalc {
 }
 ```
 
-![image-20250406174443262](D:\code\ConcurrencyAction\notes\image\image-20250406174443262.png)
+![image-20250406174443262](image\image-20250406174443262.png)
 
-一把锁可以锁上多个受保护资源，如果并发操作用的是不同的锁，那是做不到线程安全的。![image-20250406174755448](D:\code\ConcurrencyAction\notes\image\image-20250406174755448.png)
+一把锁可以锁上多个受保护资源，如果并发操作用的是不同的锁，那是做不到线程安全的。![image-20250406174755448](image\image-20250406174755448.png)
 
 ## 保护没有关联关系的多个资源
 
@@ -279,4 +279,142 @@ class Account {
 }
 ```
 
-![image-20250406180215590](D:\code\ConcurrencyAction\notes\image\image-20250406180215590.png)
+![image-20250406180215590](image\image-20250406180215590.png)
+
+# 死锁
+
+上一个转账的例子，直接锁Account.class粒度太大了，性能太差了。可以这样子，A向B账户转账，拿账户A和账户B的对象锁
+
+![image-20250407223216510](image\image-20250407223216510.png)
+
+```java
+class Account {
+  private int balance;
+  // 转账
+  void transfer(Account target, int amt){
+    // 锁定转出账户
+    synchronized(this) {              
+      // 锁定转入账户
+      synchronized(target) {           
+        if (this.balance > amt) {
+          this.balance -= amt;
+          target.balance += amt;
+        }
+      }
+    }
+  } 
+}
+```
+
+用了这个细粒度的锁，并行度就提高了，但是可能会导致死锁。比如一个线程做的是账户A往账户B转账，另外一个线程做的是账户B往账户A转账。
+
+
+
+死锁：一组相互竞争资源的线程因为相互等待，导致永久阻塞的现象。看一下有向的资源分配图：
+
+![image-20250407223519735](image\image-20250407223519735.png)
+
+## 如何预防死锁
+
+死锁的条件：
+
+1. 互斥，共享资源X和Y只能被一个线程占用【不能破解】
+2. 占用且等待：线程获得共享资源X，在等待Y资源的时候，不释放共享资源X。【可以一次性申请所有资源】
+3. 不可抢占：其他线程不能强行抢占线程占有的资源【线程申请其他资源的时候，如果申请不到，可以主动释放它占有的资源】
+4. 循环等待：线程之间相互等待其他线程占有的资源。【可以按照顺序申请资源，这样就不会循环了】
+
+### 破坏占有且等待条件
+
+增加一个管理员，所有账户申请资源都通过管理员来申请资源，一次性申请。![image-20250407223935425](image\image-20250407223935425.png)
+
+Allocator（单例），Account持有Allocator的单例对象，转账时，首先向Allocator申请资源
+
+```java
+class Allocator {
+  private List<Object> als =
+    new ArrayList<>();
+  // 一次性申请所有资源
+  synchronized boolean apply(
+    Object from, Object to){
+    if(als.contains(from) ||
+         als.contains(to)){
+      return false;  
+    } else {
+      als.add(from);
+      als.add(to);  
+    }
+    return true;
+  }
+  // 归还资源
+  synchronized void free(
+    Object from, Object to){
+    als.remove(from);
+    als.remove(to);
+  }
+}
+
+class Account {
+  // actr应该为单例
+  private Allocator actr;
+  private int balance;
+  // 转账
+  void transfer(Account target, int amt){
+    // 一次性申请转出账户和转入账户，直到成功
+    while(!actr.apply(this, target))
+      ；
+    try{
+      // 锁定转出账户
+      synchronized(this){              
+        // 锁定转入账户
+        synchronized(target){           
+          if (this.balance > amt){
+            this.balance -= amt;
+            target.balance += amt;
+          }
+        }
+      }
+    } finally {
+      actr.free(this, target)
+    }
+  } 
+}
+```
+
+
+
+### 破坏不可抢占条件
+
+synchronized不能做到，但是Lock可以做到
+
+### 破坏循环等待条件
+
+这里是按照账户的id顺序来申请锁
+
+```java
+class Account {
+  private int id;
+  private int balance;
+  // 转账
+  void transfer(Account target, int amt){
+    Account left = this        ①
+    Account right = target;    ②
+    if (this.id > target.id) { ③
+      left = target;           ④
+      right = this;            ⑤
+    }                          ⑥
+    // 锁定序号小的账户
+    synchronized(left){
+      // 锁定序号大的账户
+      synchronized(right){ 
+        if (this.balance > amt){
+          this.balance -= amt;
+          target.balance += amt;
+        }
+      }
+    }
+  } 
+}
+```
+
+
+

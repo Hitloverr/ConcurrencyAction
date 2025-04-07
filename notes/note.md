@@ -416,5 +416,65 @@ class Account {
 }
 ```
 
+# 用 等待通知 机制优化循环等待
+
+```java
+// 一次性申请转出账户和转入账户，直到成功
+while(!actr.apply(this, target))
+```
+
+如果apply方法耗时长，或者并发冲突量大的时候，可能循环很久，才能获取到锁，消耗了很多CPU资源。
+
+最好的方法：线程要求的条件不满足，那么线程阻塞自己，进入等待状态；线程要求的条件满足后，通知等待的线程重新执行。用线程阻塞的方式避免循环等待消耗CPU。
 
 
+
+一个完整的等待-通知机制：线程首先获取互斥锁，当线程要求的条件不满足时，释放互斥锁，进入等待状态；当要求的条件满足时，通知等待的线程，重新获取互斥锁。
+
+## synchronized实现
+
+![image-20250407224756115](image\image-20250407224756115.png)
+
+等待队列与互斥锁是一对一的关系，每个互斥锁有自己独立的等待队列。
+
+
+
+wait就会让当前线程阻塞，进入右边的等待队列，同时释放持有的互斥锁，其他线程就能获得锁进入临界区。
+
+notify、notifyAll会通知等待队列中的线程，告诉它条件曾经满足过，它就会再次尝试获取互斥锁。
+
+这三个API都只能在synchronized块里面使用，不然会抛出java.lang.IllegalMonitorStateException。
+
+## 一个更好地资源分配器
+
+```java
+class Allocator {
+  private List<Object> als;
+  // 一次性申请所有资源
+  synchronized void apply(Object from, Object to){
+    // 经典写法
+    while(als.contains(from) ||
+         als.contains(to)){ //重新判断条件是否满足
+      try{
+        wait();
+      }catch(Exception e){
+      }   
+    } 
+    als.add(from);
+    als.add(to);  
+  }
+  // 归还资源
+  synchronized void free(
+    Object from, Object to){
+    als.remove(from);
+    als.remove(to);
+    notifyAll();
+  }
+}
+```
+
+## 尽量使用notifyAll
+
+**notify()是会随机地通知等待队列中的一个线程，而notifyAll()会通知等待队列中的所有线程**。
+
+例子：资源A B C D。线程1申请到了AB，线程2申请到了CD，线程3此时要申请AB会进入等待队列，线程4申请CD也会进入等待队列。后面线程1归还了资源AB，如果用notify来通知等待队列中的线程，有可能被通知的是线程4，但线程4申请的是CD，还是会继续等待，而真正该唤醒的线程再也没有机会被唤醒了。

@@ -518,3 +518,90 @@ class Allocator {
 1. 吞吐量：单位时间内能处理的请求数量。
 2. 延迟：从发出请求到收到响应的时间。
 3. 并发量：能同时处理的请求数量。一般来说，随着并发量的增加，延迟也会增加。
+
+
+
+# 管程：并发编程的万能钥匙
+
+## 什么是管程
+
+管程和信号量是等价的，synchronized、wait、notifyAll都是管程的组成部分。管程Monitor，指的是管理共享变量以及对共享变量的操作过程，让他们支持并发。
+
+## MESA模型
+
+并发编程的两大核心问题：互斥【同一时刻只允许一个线程访问共享资源】和同步【线程之间如何通信、协作】。
+
+- 互斥，比如封装一个线程不安全的队列成线程安全的队列。管程X将共享变量queue和相关的操作：enq、deq封装。线程如果想要访问queue，只能通过管程调用的enq deq。这两个方法，只允许一个线程进入管程。
+- 同步：条件变量 都 对应一个等待队列。
+
+![image-20250408211241669](image\image-20250408211241669.png)
+
+- 线程发现竞态条件不满足，就会通过A.wait方法进入对应的等待队列等待。
+- 当条件满足时，线程需要调用A.notify通知A等待队列中的线程。
+
+```java
+public class BlockedQueue{ 
+    final Lock lock = new ReentrantLock();
+    // 条件变量：队列不满
+    final Condition notFull = lock.newCondition();
+	// 条件变量：队列不空
+	final Condition notEmpty = lock.newCondition();
+    // 入队 
+    void enq(T x) {
+        lock.lock();
+        try {
+          while (队列已满){
+            // 等待队列不满 
+            notFull.await();
+          }  
+          // 省略入队操作...
+          //入队后,通知可出队
+          notEmpty.signal();
+        }finally {
+          lock.unlock();
+        }
+	} 
+    // 出队 
+    void deq(){
+        lock.lock();
+        try {
+          while (队列已空){
+            // 等待队列不空
+            notEmpty.await();
+          }
+          // 省略出队操作...
+          //出队后，通知可入队
+          notFull.signal();
+        }finally {
+          lock.unlock();
+        }  
+	} 
+}
+```
+
+await和前面wait的语义是一致的，signal和notify语义是一致的。
+
+## wait的正确姿势
+
+```java
+while(条件不满足) {
+  wait();
+}
+```
+
+## notify何时可以使用
+
+1. 所有等待线程拥有相同的等待条件；
+2. 所有等待线程被唤醒后，执行相同的操作；
+3. 只需要唤醒一个线程。
+
+```java
+while (阻塞队列已满){
+  // 等待队列不满
+  notFull.await();
+}
+// 省略入队操作...
+// 入队后,通知可出队
+notEmpty.signal();
+```
+

@@ -605,3 +605,59 @@ while (阻塞队列已满){
 notEmpty.signal();
 ```
 
+
+
+# Java线程：生命周期
+
+`jstack` 命令或者`Java VisualVM`这个可视化工具将JVM所有的线程栈信息导出来，完整的线程栈信息不仅包括线程的当前状态、调用栈，还包括了锁的信息。
+
+## 通用的线程生命周期
+
+1. 初始状态：线程已经被创建，不允许分配CPU运行。仅仅是在编程语言层面，OS层面上真正的线程还没有创建
+2. 可运行状态：可以分配CPU运行。OS层面上线程创建了。
+3. 运行状态：分配到CPU的线程的状态
+4. 休眠状态：调用阻塞API 或者 等待某个事件比如条件变量，就会休眠，释放CPU使用权。
+5. 终止状态：线程执行完或者异常。
+
+Java语言里则把可运行状态和运行状态合并了，这两个状态在操作系统调度层面有用，而JVM层面不关心这两个状态，因为JVM把线程调度交给操作系统处理了。
+
+## Java中的
+
+1. NEW（初始化状态）
+2. RUNNABLE（可运行/运行状态）
+3. BLOCKED（阻塞状态）
+4. WAITING（无时限等待）
+5. TIMED_WAITING（有时限等待）
+6. TERMINATED（终止状态）
+
+![image-20250409211845554](image\image-20250409211845554.png)
+
+1. Runnable<-> Blocked: 只有等待synchronized锁没有获取到。（调用阻塞API时，OS层面线程会切换到休眠【等待IO】，但是在JVM看来等待CPU 与 等待IO没有区别，都是Runnable）
+2. Runnable<- >WAITING
+   1. synchronized 里面的Object.wait
+   2. Thread.join
+   3. LockSupport.park unpark
+3. Runnable<->TIMED_WAITING
+   1. Thread.sleep(long)
+   2. synchronized {Object.wait(long)}
+   3. Thread.join(long)
+   4. LockSupport.parkNanos(long)
+   5. LockSupport.parkUtil(long)
+4. New-> Runnable: 调用线程Thread.start
+5. Runnable->TERMINATED: 
+   1. 执行完或者异常
+   2. stop【不要用，类似suspend和resume】
+   3. interrupt 通知线程
+
+被动：
+
+- 当线程A处于WAITING、TIMED_WAITING状态时，如果其他线程调用线程A的interrupt()方法，会使线程A返回到RUNNABLE状态，同时线程A的代码会触发InterruptedException异常。
+- 当线程A处于RUNNABLE状态时，并且阻塞在java.nio.channels.InterruptibleChannel上时，如果其他线程调用线程A的interrupt()方法，线程A会触发java.nio.channels.ClosedByInterruptException这个异常
+- 阻塞在java.nio.channels.Selector上时，如果其他线程调用线程A的interrupt()方法，线程A的java.nio.channels.Selector会立即返回
+
+主动：
+
+- 线程可以自己通过isInterrupted方法，检测自己是不是被中断了。
+
+
+

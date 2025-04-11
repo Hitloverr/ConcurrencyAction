@@ -830,3 +830,179 @@ public class SafeWM {
 - 迫不得已时才使用低级的同步原语：低级的同步原语主要指的是synchronized、Lock、Semaphore等
 - 避免过早优化：安全第一，并发程序首先要保证安全，出现性能瓶颈后再优化
 
+# 总结课（1）
+
+![image-20250411210213674](image\image-20250411210213674.png)
+
+**锁，应是私有的、不可变的、不可重用的**。
+
+Integer String因为可能是被重用的，可能锁被其他代码使用，可能拿不到锁。
+
+```java
+class Account {
+  // 账户余额  
+  private Integer balance;
+  // 账户密码
+  private String password;
+  // 取款
+  void withdraw(Integer amt) {
+    synchronized(balance) {
+      if (this.balance > amt){
+        this.balance -= amt;
+      }
+    }
+  } 
+  // 更改密码
+  void updatePassword(String pw){
+    synchronized(password) {
+      this.password = pw;
+    }
+  } 
+}
+```
+
+
+
+最佳实践
+
+```java
+// 普通对象锁
+private final Object 
+  lock = new Object();
+// 静态对象锁
+private static final Object
+  lock = new Object(); 
+```
+
+方法的调用，是先计算参数，然后将参数压入调用栈之后才会执行方法体.
+
+这有个额外的知识点：
+
+```java
+logger.debug("The var1：" + 
+  var1 + ", var2:" + var2); // info级别日志打印的时候，仍然会计算参数
+
+logger.debug("The var1：{}, var2:{}", 
+  var1, var2); // 仅仅是参数压栈，并不会计算。
+```
+
+中断标识可能会自动清除：
+
+```java
+Thread th = Thread.currentThread();
+while(true) {
+  if(th.isInterrupted()) {
+    break;
+  }
+  // 省略业务代码无数
+  try {
+    Thread.sleep(100);
+  }catch (InterruptedException e){
+    e.printStackTrace();
+      // 重新设置中断标志位
+  th.interrupt();
+  }
+}
+```
+
+# Lock 和Condition
+
+## 为什么还有个Lock
+
+破坏不可抢占条件的话，synchronized做不到。我们希望做到：
+
+> 对于“不可抢占”这个条件，占用部分资源的线程进一步申请其他资源时，如果申请不到，可以主动释放它占有的资源，这样不可抢占这个条件就破坏掉了。
+
+
+
+1. 能响应中断：阻塞中的线程希望能被唤醒，释放它之前占有的锁
+2. 支持超时：线程一段时间没有获取到锁，不是进入阻塞态而是返回错误，能释放之前锁
+3. 非阻塞地获取锁：获取锁不到，不被阻塞，可以释放之前的锁。
+
+```java
+// 支持中断的API
+void lockInterruptibly() 
+  throws InterruptedException;
+// 支持超时的API
+boolean tryLock(long time, TimeUnit unit) 
+  throws InterruptedException;
+// 支持非阻塞获取锁的API
+boolean tryLock();
+```
+
+## 如何保证可见性
+
+```java
+class X {
+  private final Lock rtl =
+  new ReentrantLock();
+  int value;
+  public void addOne() {
+    // 获取锁
+    rtl.lock();  
+    try {
+      value+=1;
+    } finally {
+      // 保证锁能释放
+      rtl.unlock();
+    }
+  }
+}
+```
+
+Java SDK里面的ReentrantLock，内部持有一个volatile 的成员变量state，获取锁的时候，会读写state的值；解锁的时候，也会读写state的值。也就是说，在执行value+=1之前，程序先读写了一次volatile变量state，在执行value+=1之后，又读写了一次volatile变量state。根据相关的Happens-Before规则：
+
+```java
+// 省略代码无数
+state = 1;
+} // 解锁 unlock() {
+
+// 省略代码无数
+state = 0;
+} }
+```
+
+
+
+1. **顺序性规则**：对于线程T1，value+=1 Happens-Before 释放锁的操作unlock()；
+
+2. **volatile变量规则**：由于state = 1会先读取state，所以线程T1的unlock()操作Happens-Before线程T2的lock()操作；
+
+3. **传递性规则**：线程 T1的value+=1 Happens-Before 线程 T2 的 lock() 操作。
+
+   class SampleLock { volatile int state; // 加锁 lock() {
+
+## 什么是可重入锁？
+
+一个线程获取到锁之后，如果想再获取一下锁，能顺利获取就是可重入锁。
+
+可重入函数，指的是多个线程可以同时调用该函数，并且支持线程切换，每个线程都能得到正确的结果。（必定是线程安全的）
+
+## 公平锁与非公平锁
+
+```java
+//无参构造函数：默认非公平锁
+public ReentrantLock() {
+    sync = new NonfairSync();
+}
+//根据公平策略参数创建锁
+public ReentrantLock(boolean fair){
+    sync = fair ? new FairSync() 
+                : new NonfairSync();
+}
+```
+
+入口等待队列，锁都对应着一个等待队列，如果一个线程没有获得锁，就会进入等待队列，当有线程释放锁的时候，就需要从等待队列中唤醒一个等待的线程。如果是公平锁，唤醒的策略就是谁等待的时间长，就唤醒谁，很公平；如果是非公平锁，则不提供这个公平保证，有可能等待时间短的线程反而先被唤醒。
+
+## 用锁的最佳实践
+
+1. 永远只在更新对象的成员变量时加锁
+2. 永远只在访问可变的成员变量时加锁
+3. 永远不在调用其他对象的方法时加锁
+
+关于第三条，调用其他对象的方法，实在是太不安全了，也许“其他”方法里面有线程sleep()的调用，也可能会有奇慢无比的I/O操作，这些都会严重影响性能。更可怕的是，“其他”类的方法可能也会加锁，然后双重加锁就可能导致死锁
+
+
+
+减少锁的持有时间、减小锁的粒度.
+

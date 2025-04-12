@@ -1006,3 +1006,142 @@ public ReentrantLock(boolean fair){
 
 减少锁的持有时间、减小锁的粒度.
 
+# Dubbo如何利用管程实现异步转同步
+
+Condition能支持多个条件变量
+
+## 利用两个条件变量实现阻塞队列
+
+```
+public class BlockedQueue<T>{
+  final Lock lock =
+    new ReentrantLock();
+  // 条件变量：队列不满  
+  final Condition notFull =
+    lock.newCondition();
+  // 条件变量：队列不空  
+  final Condition notEmpty =
+    lock.newCondition();
+
+  // 入队
+  void enq(T x) {
+    lock.lock();
+    try {
+      while (队列已满){
+        // 等待队列不满
+        notFull.await();
+      }  
+      // 省略入队操作...
+      //入队后,通知可出队
+      notEmpty.signal();
+    }finally {
+      lock.unlock();
+    }
+  }
+  // 出队
+  void deq(){
+    lock.lock();
+    try {
+      while (队列已空){
+        // 等待队列不空
+        notEmpty.await();
+      }  
+      // 省略出队操作...
+      //出队后，通知可入队
+      notFull.signal();
+    }finally {
+      lock.unlock();
+    }  
+  }
+}
+```
+
+## 同步和异步
+
+**调用方是否需要等待结果，如果需要等待结果，就是同步；如果不需要等待结果，就是异步**。
+
+1. 调用方创建一个子线程，在子线程中执行方法调用，这种调用我们称为异步调用；
+2. 方法实现的时候，创建一个新的线程执行主要逻辑，主线程直接return，这种方法我们一般称为异步方法。
+
+## Dubbo
+
+异步的场景还是挺多的，比如TCP协议本身就是异步的，我们工作中经常用到的RPC调用，**在TCP协议层面，发送完RPC请求后，线程是不会等待RPC的响应结果的**。
+
+Dubbo帮我们做了异步转同步的动作
+
+```java
+DemoService service = 初始化部分省略
+String message = 
+  service.sayHello("dubbo");
+System.out.println(message);
+```
+
+调用线程阻塞了，线程状态是TIMED_WAITING。本来发送请求是异步的，但是调用线程却阻塞了，说明Dubbo帮我们做了异步转同步的事情。通过调用栈，你能看到线程是阻塞在DefaultFuture.get()方法上
+
+![image-20250412102913138](image\image-20250412102913138.png)
+
+```java
+public class DubboInvoker{
+  Result doInvoke(Invocation inv){
+    // 下面这行就是源码中108行
+    // 为了便于展示，做了修改
+    return currentClient 
+      .request(inv, timeout)
+      .get();
+  }
+}
+```
+
+需求：当RPC返回结果之前，阻塞调用线程，让调用线程等待；当RPC返回结果后，唤醒调用线程，让调用线程重新执行。
+
+```java
+// 创建锁与条件变量
+private final Lock lock 
+    = new ReentrantLock();
+private final Condition done 
+    = lock.newCondition();
+
+// 调用方通过该方法等待结果
+Object get(int timeout){
+  long start = System.nanoTime();
+  lock.lock();
+  try {
+	while (!isDone()) {
+	  done.await(timeout);
+      long cur=System.nanoTime();
+	  if (isDone() || 
+          cur-start > timeout){
+	    break;
+	  }
+	}
+  } finally {
+	lock.unlock();
+  }
+  if (!isDone()) {
+	throw new TimeoutException();
+  }
+  return returnFromResponse();
+}
+// RPC结果是否已经返回
+boolean isDone() {
+  return response != null;
+}
+// RPC结果返回时调用该方法   
+private void doReceived(Response res) {
+  lock.lock();
+  try {
+    response = res;
+    if (done != null) {
+      done.signal();
+    }
+  } finally {
+    lock.unlock();
+  }
+}
+```
+
+调用lock()获取锁，在finally里面调用unlock()释放锁；获取锁后，通过经典的在循环中调用await()方法来实现等待。
+
+当RPC结果返回时，会调用doReceived()方法，这个方法里面，调用lock()获取锁，在finally里面调用unlock()释放锁，获取锁后通过调用signal()来通知调用线程，结果已经返回，不用继续等待了。
+
+例如创建云主机，就是一个异步的API，调用虽然成功了，但是云主机并没有创建成功，你需要调用另外一个API去轮询云主机的状态。如果你需要在项目内部封装创建云主机的API，你也会面临异步转同步的问题，因为同步的API更易用。

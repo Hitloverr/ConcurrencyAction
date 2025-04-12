@@ -1145,3 +1145,131 @@ private void doReceived(Response res) {
 当RPC结果返回时，会调用doReceived()方法，这个方法里面，调用lock()获取锁，在finally里面调用unlock()释放锁，获取锁后通过调用signal()来通知调用线程，结果已经返回，不用继续等待了。
 
 例如创建云主机，就是一个异步的API，调用虽然成功了，但是云主机并没有创建成功，你需要调用另外一个API去轮询云主机的状态。如果你需要在项目内部封装创建云主机的API，你也会面临异步转同步的问题，因为同步的API更易用。
+
+
+
+# Semaphore：实现一个限流器
+
+## 信号量模型
+
+![image-20250412103415811](image\image-20250412103415811.png)
+
+- init()：设置计数器的初始值。
+- down()：计数器的值减1；如果此时计数器的值小于0，则当前线程将被阻塞，否则当前线程可以继续执行。
+- up()：计数器的值加1；如果此时计数器的值小于或者等于0，则唤醒等待队列中的一个线程，并将其从等待队列中移除。
+
+init()、down()和up()三个方法都是原子性的，并且这个原子性是由信号量模型的实现方保证的
+
+```java
+class Semaphore{
+  // 计数器
+  int count;
+  // 等待队列
+  Queue queue;
+  // 初始化操作
+  Semaphore(int c){
+    this.count=c;
+  }
+  // 
+  void down(){
+    this.count--;
+    if(this.count<0){
+      //将当前线程插入等待队列
+      //阻塞当前线程
+    }
+  }
+  void up(){
+    this.count++;
+    if(this.count<=0) {
+      //移除等待队列中的某个线程T
+      //唤醒线程T
+    }
+  }
+}
+```
+
+down()、up()这两个操作历史上最早称为P操作和V操作，所以信号量模型也被称为PV原语。
+
+## 如何使用信号量
+
+只需要在进入临界区之前执行一下down()操作，退出临界区之前执行一下up()操作就可以了。下面是Java代码的示例，acquire()就是信号量里的down()操作，release()就是信号量里的up()操作
+
+```java
+static int count;
+//初始化信号量
+static final Semaphore s 
+    = new Semaphore(1);
+//用信号量保证互斥    
+static void addOne() {
+  s.acquire();
+  try {
+    count+=1;
+  } finally {
+    s.release();
+  }
+}
+```
+
+假设两个线程T1和T2同时访问addOne()方法，当它们同时调用acquire()的时候，由于acquire()是一个原子操作，所以只能有一个线程（假设T1）把信号量里的计数器减为0，另外一个线程（T2）则是将计数器减为-1。对于线程T1，信号量里面的计数器的值是0，大于等于0，所以线程T1会继续执行；对于线程T2，信号量里面的计数器的值是-1，小于0，按照信号量模型里对down()操作的描述，线程T2将被阻塞。所以此时只有线程T1会进入临界区执行`count+=1；`
+
+
+
+当线程T1执行release()操作，也就是up()操作的时候，信号量里计数器的值是-1，加1之后的值是0，小于等于0，按照信号量模型里对up()操作的描述，此时等待队列中的T2将会被唤醒。于是T2在T1执行完临界区代码之后才获得了进入临界区执行的机会，从而保证了互斥性。
+
+## 快速实现一个限流器
+
+Semaphore还有一个功能是Lock不容易实现的，那就是：**Semaphore可以允许多个线程访问一个临界区**。
+
+
+
+比较常见的需求就是我们工作中遇到的各种池化资源，例如连接池、对象池、线程池等等。其中，你可能最熟悉数据库连接池，在同一时刻，一定是允许多个线程同时使用连接池的，当然，每个连接在被释放前，是不允许其他线程使用的。
+
+
+
+如果我们把计数器的值设置成对象池里对象的个数N，就能完美解决对象池的限流问题了
+
+```java
+class ObjPool<T, R> {
+  final List<T> pool;
+  // 用信号量实现限流器
+  final Semaphore sem;
+  // 构造函数
+  ObjPool(int size, T t){
+    pool = new Vector<T>(){};
+    for(int i=0; i<size; i++){
+      pool.add(t);
+    }
+    sem = new Semaphore(size);
+  }
+  // 利用对象池的对象，调用func
+  R exec(Function<T,R> func) {
+    T t = null;
+    sem.acquire();
+    try {
+      t = pool.remove(0);
+      return func.apply(t);
+    } finally {
+      pool.add(t);
+      sem.release();
+    }
+  }
+}
+// 创建对象池
+ObjPool<Long, String> pool = 
+  new ObjPool<Long, String>(10, 2);
+// 通过对象池获取t，之后执行  
+pool.exec(t -> {
+    System.out.println(t);
+    return t.toString();
+});
+```
+
+用一个List来保存对象实例，用Semaphore实现限流器。关键的代码是ObjPool里面的exec()方法，这个方法里面实现了限流的功能。在这个方法里面，我们首先调用acquire()方法（与之匹配的是在finally里面调用release()方法），假设对象池的大小是10，信号量的计数器初始化为10，那么前10个线程调用acquire()方法，都能继续执行，相当于通过了信号灯，而其他线程则会阻塞在acquire()方法上。
+
+
+
+对于通过信号灯的线程，我们为每个线程分配了一个对象 t（这个分配工作是通过pool.remove(0)实现的），分配完之后会执行一个回调函数func，而函数的参数正是前面分配的对象 t ；
+
+
+
+执行完回调函数之后，它们就会释放对象（这个释放工作是通过pool.add(t)实现的），同时调用release()方法来更新信号量的计数器。如果此时信号量里计数器的值小于等于0，那么说明有线程在等待，此时会自动唤醒等待的线程

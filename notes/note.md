@@ -1794,3 +1794,130 @@ void checkAll(){
 1. **CountDownLatch主要用来解决一个线程等待多个线程的场景**，可以类比旅游团团长要等待所有的游客到齐才能去下一个景点；而**CyclicBarrier是一组线程之间互相等待**，更像是几个驴友之间不离不弃。
 2. CountDownLatch的计数器是不能循环利用的，也就是说一旦计数器减到0，再有线程调用await()，该线程会直接通过。但**CyclicBarrier的计数器是可以循环利用的**，而且具备自动重置的功能，一旦计数器减到0会自动重置到你设置的初始值
 3. CyclicBarrier还可以设置回调函数
+
+
+
+# 并发容器的坑
+
+## 同步容器以及注意事项
+
+List、Map、Set和Queue；如何将非线程安全的容器变成线程安全的容器？只要把非线程安全的容器封装在对象内部，然后控制好访问路径就可以了。
+
+```java
+SafeArrayList<T>{
+  //封装ArrayList
+  List<T> c = new ArrayList<>();
+  //控制访问路径
+  synchronized
+  T get(int idx){
+    return c.get(idx);
+  }
+
+  synchronized
+  void add(int idx, T t) {
+    c.add(idx, t);
+  }
+
+  synchronized
+  boolean addIfNotExist(T t){
+    if(!c.contains(t)) {
+      c.add(t);
+      return true;
+    }
+    return false;
+  }
+}
+```
+
+在Collections这个类中还提供了一套完备的包装类，比如下面的示例代码中，分别把ArrayList、HashSet和HashMap包装成了线程安全的List、Set和Map。
+
+```java
+List list = Collections.
+  synchronizedList(new ArrayList());
+Set set = Collections.
+  synchronizedSet(new HashSet());
+Map map = Collections.
+  synchronizedMap(new HashMap());
+```
+
+**组合操作需要注意竞态条件问题**，即便每个操作都能保证原子性，也并不能保证组合操作的原子性，这个一定要注意。
+
+
+
+**一个容易被忽视的“坑”是用迭代器遍历容器**，例如在下面的代码中，通过迭代器遍历容器list，对每个元素调用foo()方法，这就存在并发问题，这些组合的操作不具备原子性。
+
+```java
+List list = Collections.
+  synchronizedList(new ArrayList());
+Iterator i = list.iterator(); 
+while (i.hasNext())
+  foo(i.next());
+```
+
+而正确做法是下面这样，锁住list之后再执行遍历操作。如果你查看Collections内部的包装类源码，你会发现包装类的公共方法锁的是对象的this，其实就是我们这里的list，所以锁住list绝对是线程安全的。
+
+```java
+List list = Collections.
+  synchronizedList(new ArrayList());
+synchronized (list) {  
+  Iterator i = list.iterator(); 
+  while (i.hasNext())
+    foo(i.next());
+}    
+```
+
+基于synchronized这个同步关键字实现的，所以也被称为**同步容器**。Java提供的同步容器还有Vector、Stack和Hashtable
+
+## 并发容器和注意事项
+
+![image-20250414182525972](image\image-20250414182525972.png)
+
+### List
+
+**CopyOnWriteArrayList**内部维护了一个数组，成员变量array就指向这个内部数组，所有的读操作都是基于array进行的，如下图所示，迭代器Iterator遍历的就是array数组。
+
+
+
+如果在遍历array的同时，还有一个写操作，例如增加元素，CopyOnWriteArrayList是如何处理的呢？CopyOnWriteArrayList会将array复制一份，然后在新复制处理的数组上执行增加元素的操作，执行完之后再将array指向这个新的数组。读写是可以并行的，**遍历操作一直都是基于原array执行，而写操作则是基于新array进行**。
+
+
+
+一个是应用场景，CopyOnWriteArrayList仅适用于写操作非常少的场景，而且能够容忍读写的短暂不一致。例如上面的例子中，写入的新元素并不能立刻被遍历到。
+
+另一个需要注意的是，CopyOnWriteArrayList迭代器是只读的，不支持增删改。因为迭代器遍历的仅仅是一个快照，而对快照进行增删改是没有意义的。
+
+
+
+### Map
+
+**ConcurrentHashMap的key是无序的，而ConcurrentSkipListMap的key是有序的**。所以如果你需要保证key的顺序，就只能使用ConcurrentSkipListMap。
+
+它们的key和value都不能为空，否则会抛出`NullPointerException`这个运行时异常。
+
+![image-20250414182712248](image\image-20250414182712248.png)
+
+ConcurrentSkipListMap里面的SkipList本身就是一种数据结构，中文一般都翻译为“跳表”。跳表插入、删除、查询操作平均的时间复杂度是 O(log n)，理论上和并发线程数没有关系，所以在并发度非常高的情况下，若你对ConcurrentHashMap的性能还不满意，可以尝试一下ConcurrentSkipListMap。
+
+### Set
+
+CopyOnWriteArraySet和ConcurrentSkipListSet，使用场景可以参考前面讲述的CopyOnWriteArrayList和ConcurrentSkipListMap，它们的原理都是一样的
+
+### Queue
+
+一个维度是**阻塞与非阻塞**，所谓阻塞指的是当队列已满时，入队操作阻塞；当队列已空时，出队操作阻塞。另一个维度是**单端与双端**，单端指的是只能队尾入队，队首出队；而双端指的是队首队尾皆可入队出队。Java并发包里**阻塞队列都用Blocking关键字标识，单端队列使用Queue标识，双端队列使用Deque标识**。
+
+
+
+1.**单端阻塞队列**：其实现有ArrayBlockingQueue、LinkedBlockingQueue、SynchronousQueue、LinkedTransferQueue、PriorityBlockingQueue和DelayQueue。内部一般会持有一个队列，这个队列可以是数组（其实现是ArrayBlockingQueue）也可以是链表（其实现是LinkedBlockingQueue）；甚至还可以不持有队列（其实现是SynchronousQueue），此时生产者线程的入队操作必须等待消费者线程的出队操作。而LinkedTransferQueue融合LinkedBlockingQueue和SynchronousQueue的功能，性能比LinkedBlockingQueue更好；PriorityBlockingQueue支持按照优先级出队；DelayQueue支持延时出队。
+
+![image-20250414182902077](image\image-20250414182902077.png)
+
+2.**双端阻塞队列**：其实现是LinkedBlockingDeque。
+
+3.**单端非阻塞队列**：其实现是ConcurrentLinkedQueue。-
+
+4.**双端非阻塞队列**：其实现是ConcurrentLinkedDeque。
+
+
+
+使用队列时，需要格外注意队列是否支持有界（所谓有界指的是内部的队列是否有容量限制）。实际工作中，一般都不建议使用无界的队列，因为数据量大了之后很容易导致OOM。只有ArrayBlockingQueue和LinkedBlockingQueue是支持有界的

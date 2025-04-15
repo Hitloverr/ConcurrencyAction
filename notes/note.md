@@ -2131,3 +2131,140 @@ boolean compareAndSet(
 ```java
 ```
 
+# Executor与线程池：创建正确的线程池
+
+创建一个线程，却需要调用操作系统内核的API，然后操作系统要为线程分配一系列的资源，这个成本就很高了，所以**线程是一个重量级的对象，应该避免频繁创建和销毁**
+
+```java
+class XXXPool{
+  // 获取池化资源
+  XXX acquire() {
+  }
+  // 释放池化资源
+  void release(XXX x){
+  }
+}  
+```
+
+## 线程池是一种生产者-消费者模式
+
+```java
+//采用一般意义上池化资源的设计方法
+class ThreadPool{
+  // 获取空闲线程
+  Thread acquire() {
+  }
+  // 释放线程
+  void release(Thread t){
+  }
+} 
+//期望的使用
+ThreadPool pool；
+Thread T1=pool.acquire();
+//传入Runnable对象
+T1.execute(()->{
+  //具体业务逻辑
+  ......
+});
+```
+
+线程池的设计，没有办法直接采用一般意义上池化资源的设计方法。普遍采用的都是**生产者-消费者模式**。线程池的使用方是生产者，线程池本身是消费者。
+
+```java
+//简化的线程池，仅用来说明工作原理
+class MyThreadPool{
+  //利用阻塞队列实现生产者-消费者模式
+  BlockingQueue<Runnable> workQueue;
+  //保存内部工作线程
+  List<WorkerThread> threads 
+    = new ArrayList<>();
+  // 构造方法
+  MyThreadPool(int poolSize, 
+    BlockingQueue<Runnable> workQueue){
+    this.workQueue = workQueue;
+    // 创建工作线程
+    for(int idx=0; idx<poolSize; idx++){
+      WorkerThread work = new WorkerThread();
+      work.start();
+      threads.add(work);
+    }
+  }
+  // 提交任务
+  void execute(Runnable command){
+    workQueue.put(command);
+  }
+  // 工作线程负责消费任务，并执行任务
+  class WorkerThread extends Thread{
+    public void run() {
+      //循环取任务并执行
+      while(true){ ①
+        Runnable task = workQueue.take();
+        task.run();
+      } 
+    }
+  }  
+}
+
+/** 下面是使用示例 **/
+// 创建有界阻塞队列
+BlockingQueue<Runnable> workQueue = 
+  new LinkedBlockingQueue<>(2);
+// 创建线程池  
+MyThreadPool pool = new MyThreadPool(
+  10, workQueue);
+// 提交任务  
+pool.execute(()->{
+    System.out.println("hello");
+});
+```
+
+维护了一个阻塞队列workQueue和一组工作线程，工作线程的个数由构造函数中的poolSize来指定。用户通过调用execute()方法来提交Runnable任务，execute()方法的内部实现仅仅是将任务加入到workQueue中。MyThreadPool内部维护的工作线程会消费workQueue中的任务并执行任务，相关的代码就是代码①处的while循环
+
+## 如何使用线程池
+
+```java
+ThreadPoolExecutor(
+  int corePoolSize,
+  int maximumPoolSize,
+  long keepAliveTime,
+  TimeUnit unit,
+  BlockingQueue<Runnable> workQueue,
+  ThreadFactory threadFactory,
+  RejectedExecutionHandler handler) 
+```
+
+- **corePoolSize**：表示线程池保有的最小线程数。有些项目很闲，但是也不能把人都撤了，至少要留corePoolSize个人坚守阵地。
+- **maximumPoolSize**：表示线程池创建的最大线程数。当项目很忙时，就需要加人，但是也不能无限制地加，最多就加到maximumPoolSize个人。当项目闲下来时，就要撤人了，最多能撤到corePoolSize个人。
+- **keepAliveTime & unit**：上面提到项目根据忙闲来增减人员，那在编程世界里，如何定义忙和闲呢？很简单，一个线程如果在一段时间内，都没有执行任务，说明很闲，keepAliveTime 和 unit 就是用来定义这个“一段时间”的参数。也就是说，如果一个线程空闲了`keepAliveTime & unit`这么久，而且线程池的线程数大于 corePoolSize ，那么这个空闲的线程就要被回收了。
+- **workQueue**：工作队列，和上面示例代码的工作队列同义。
+- **threadFactory**：通过这个参数你可以自定义如何创建线程，例如你可以给线程指定一个有意义的名字。
+- **handler**：通过这个参数你可以自定义任务的拒绝策略。如果线程池中所有的线程都在忙碌，并且工作队列也满了（前提是工作队列是有界队列），那么此时提交任务，线程池就会拒绝接收。
+  - CallerRunsPolicy：提交任务的线程自己去执行该任务。
+  - AbortPolicy：默认的拒绝策略，会throws RejectedExecutionException。
+  - DiscardPolicy：直接丢弃任务，没有任何异常抛出。
+  - DiscardOldestPolicy：丢弃最老的任务，其实就是把最早进入工作队列的任务丢弃，然后把新任务加入到工作队列。
+
+Java在1.6版本还增加了 allowCoreThreadTimeOut(boolean value) 方法，它可以让所有线程都支持超时，这意味着如果项目很闲，就会将项目组的成员都撤走。
+
+## 使用线程池的注意事项
+
+Executors提供的很多方法默认使用的都是无界的LinkedBlockingQueue，高负载情境下，无界队列很容易导致OOM，而OOM会导致所有请求都无法处理，这是致命问题。所以**强烈建议使用有界队列**。
+
+
+
+使用有界队列，当任务过多时，线程池会触发执行拒绝策略，线程池默认的拒绝策略会throw RejectedExecutionException 这是个运行时异常，对于运行时异常编译器并不强制catch它，所以开发人员很容易忽略。因此**默认拒绝策略要慎重使用**。如果线程池处理的任务非常重要，建议自定义自己的拒绝策略；并且在实际工作中，自定义的拒绝策略往往和降级策略配合使用。
+
+
+
+通过ThreadPoolExecutor对象的execute()方法提交任务时，如果任务在执行的过程中出现运行时异常，会导致执行任务的线程终止；不过，最致命的是任务虽然异常了，但是你却获取不到任何通知，这会让你误以为任务都执行得很正常。虽然线程池提供了很多用于异常处理的方法，但是最稳妥和简单的方案还是捕获所有异常并按需处理
+
+```java
+try {
+  //业务逻辑
+} catch (RuntimeException x) {
+  //按需处理
+} catch (Throwable x) {
+  //按需处理
+} 
+```
+

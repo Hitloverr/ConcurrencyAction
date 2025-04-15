@@ -1921,3 +1921,213 @@ CopyOnWriteArraySet和ConcurrentSkipListSet，使用场景可以参考前面讲�
 
 
 使用队列时，需要格外注意队列是否支持有界（所谓有界指的是内部的队列是否有容量限制）。实际工作中，一般都不建议使用无界的队列，因为数据量大了之后很容易导致OOM。只有ArrayBlockingQueue和LinkedBlockingQueue是支持有界的
+
+# 原子类：无锁工具
+
+可见性：volatile； 原子性：互斥。
+
+
+
+```java
+public class Test {
+  AtomicLong count = 
+    new AtomicLong(0);
+  // 这个是线程安全的。  
+  void add10K() {
+    int idx = 0;
+    while(idx++ < 10000) {
+      count.getAndIncrement();
+    }
+  }
+}
+```
+
+无锁方案：最大的好处是性能。没有加锁 解锁的性能消耗，还能保证互斥
+
+## 无锁方案的实现原理
+
+CPU为了解决并发问题，提供了CAS指令（CAS，全称是Compare And Swap，即“比较并交换”）。CAS指令包含3个参数：共享变量的内存地址A、用于比较的值B和共享变量的新值C；并且只有当内存中地址A处的值等于B时，才能将内存中地址A处的值更新为新值C。**作为一条CPU指令，CAS指令本身是能够保证原子性的**。
+
+一个是期望值expect，另一个是需要写入的新值newValue，**只有当目前count的值和期望值expect相等时，才会将count更新为newValue**。
+
+```java
+class SimulatedCAS{
+  int count；
+  synchronized int cas(
+    int expect, int newValue){
+    // 读目前count的值
+    int curValue = count;
+    // 比较目前count值是否==期望值
+    if(curValue == expect){
+      // 如果是，则更新count的值
+      count = newValue;
+    }
+    // 返回写入前的值
+    return curValue;
+  }
+}
+```
+
+基于内存中count的当前值A计算出来的count+=1为A+1，在将A+1写入内存的时候，很可能此时内存中count已经被其他线程更新过了，这样就会导致错误地覆盖其他线程写入的值。也就是说，只有当内存中count的值等于期望值A时，才能将内存中count的值更新为计算结果A+1。
+
+使用CAS来解决并发问题，一般都会伴随着自旋，而所谓自旋，其实就是循环尝试。例如，实现一个线程安全的`count += 1`操作，“CAS+自旋”的实现方案如下所示，首先计算newValue = count+1，如果cas(count,newValue)返回的值不等于count，则意味着线程在执行完代码①处之后，执行代码②处之前，count的值被其他线程更新过。那此时该怎么处理呢？可以采用自旋方案，就像下面代码中展示的，可以重新读count最新的值来计算newValue并尝试再次更新，直到成功。
+
+```java
+class SimulatedCAS{
+  volatile int count;
+  // 实现count+=1
+  addOne(){
+    do {
+      newValue = count+1; //①
+    }while(count !=
+      cas(count,newValue) //②
+  }
+  // 模拟实现CAS，仅用来帮助理解
+  synchronized int cas(
+    int expect, int newValue){
+    // 读目前count的值
+    int curValue = count;
+    // 比较目前count值是否==期望值
+    if(curValue == expect){
+      // 如果是，则更新count的值
+      count= newValue;
+    }
+    // 返回写入前的值
+    return curValue;
+  }
+}
+```
+
+**ABA**的问题。StampedLock之类的，version
+
+## 原子化的count += 1
+
+```java
+// this和valueOffset两个参数可以唯一确定共享变量的内存地址。
+final long getAndIncrement() {
+  return unsafe.getAndAddLong(
+    this, valueOffset, 1L);
+}
+```
+
+unsafe.getAndAddLong()方法的源码如下，该方法首先会在内存中读取共享变量的值，之后循环调用compareAndSwapLong()方法来尝试设置共享变量的值，直到成功为止。compareAndSwapLong()是一个native方法，只有当内存中共享变量的值等于expected时，才会将共享变量的值更新为x，并且返回true；否则返回fasle。compareAndSwapLong的语义和CAS指令的语义的差别仅仅是返回值不同而已。
+
+```java
+public final long getAndAddLong(
+  Object o, long offset, long delta){
+  long v;
+  do {
+    // 读取内存中的值
+    v = getLongVolatile(o, offset);
+  } while (!compareAndSwapLong(
+      o, offset, v, v + delta));
+  return v;
+}
+//原子性地将变量更新为x
+//条件是内存中的值等于expected
+//更新成功则返回true
+native boolean compareAndSwapLong(
+  Object o, long offset, 
+  long expected,
+  long x);
+```
+
+```java
+do {
+  // 获取当前值
+  oldV = xxxx；
+  // 根据当前值计算新值
+  newV = ...oldV...
+}while(!compareAndSet(oldV,newV);
+```
+
+## 原子类概览
+
+**原子化的基本数据类型、原子化的对象引用类型、原子化数组、原子化对象属性更新器**和**原子化的累加器**
+
+![image-20250415122917346](image\image-20250415122917346.png)
+
+AtomicBoolean、AtomicInteger和AtomicLong
+
+```java
+getAndIncrement() //原子化i++
+getAndDecrement() //原子化的i--
+incrementAndGet() //原子化的++i
+decrementAndGet() //原子化的--i
+//当前值+=delta，返回+=前的值
+getAndAdd(delta) 
+//当前值+=delta，返回+=后的值
+addAndGet(delta)
+//CAS操作，返回是否成功
+compareAndSet(expect, update)
+//以下四个方法
+//新值可以通过传入func函数来计算
+getAndUpdate(func)
+updateAndGet(func)
+getAndAccumulate(x,func)
+accumulateAndGet(x,func)
+```
+
+
+
+原子化的对象引用类型：AtomicReference、AtomicStampedReference和AtomicMarkableReference。AtomicStampedReference和AtomicMarkableReference这两个原子类可以解决ABA问题。
+
+
+
+增加一个版本号维度
+
+```java
+boolean compareAndSet(
+  V expectedReference,
+  V newReference,
+  int expectedStamp,
+  int newStamp) 
+```
+
+版本号简化成了一个Boolean值
+
+```java
+boolean compareAndSet(
+  V expectedReference,
+  V newReference,
+  boolean expectedMark,
+  boolean newMark)
+```
+
+
+
+
+
+原子化数组：AtomicIntegerArray、AtomicLongArray和AtomicReferenceArray。原子化地更新数组里面的每一个元素。这些类提供的方法和原子化的基本数据类型的区别仅仅是：每个方法多了一个数组的索引参数
+
+
+
+原子化对象属性更新器：AtomicIntegerFieldUpdater、AtomicLongFieldUpdater和AtomicReferenceFieldUpdater
+
+```java
+public static <U>
+AtomicXXXFieldUpdater<U> 
+newUpdater(Class<U> tclass, 
+  String fieldName)
+```
+
+需要注意的是，**对象属性必须是volatile类型的，只有这样才能保证可见性**；如果对象属性不是volatile类型的，newUpdater()方法会抛出IllegalArgumentException这个运行时异常。
+
+
+
+原子化对象属性更新器相关的方法，相比原子化的基本数据类型仅仅是多了对象引用参数
+
+```java
+boolean compareAndSet(
+  T obj, 
+  int expect, 
+  int update)
+```
+
+
+
+原子化的累加器：DoubleAccumulator、DoubleAdder、LongAccumulator和LongAdder.不支持compareAndSet()方法。如果你仅仅需要累加操作，使用原子化的累加器性能会更好。
+
+```java
+```
+

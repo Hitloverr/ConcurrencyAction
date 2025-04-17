@@ -2268,3 +2268,184 @@ try {
 } 
 ```
 
+# Future：如何用多线程实现最优的 烧水泡茶程序
+
+## 如何获取任务执行结果？
+
+```java
+// 提交Runnable任务
+Future<?> 
+  submit(Runnable task);
+// 提交Callable任务
+<T> Future<T> 
+  submit(Callable<T> task);
+// 提交Runnable任务及结果引用  
+<T> Future<T> 
+  submit(Runnable task, T result);
+```
+
+**取消任务的方法cancel()、判断任务是否已取消的方法isCancelled()、判断任务是否已结束的方法isDone()**以及**2个获得任务执行结果的get()和get(timeout, unit)**
+
+这两个get()方法都是阻塞式的，如果被调用的时候，任务还没有执行完，那么调用get()方法的线程会阻塞，直到任务执行完才会被唤醒。
+
+```java
+// 取消任务
+boolean cancel(
+  boolean mayInterruptIfRunning);
+// 判断任务是否已取消  
+boolean isCancelled();
+// 判断任务是否已结束
+boolean isDone();
+// 获得任务执行结果
+get();
+// 获得任务执行结果，支持超时
+get(long timeout, TimeUnit unit);
+```
+
+1. 提交Runnable任务 `submit(Runnable task)` ：这个方法的参数是一个Runnable接口，Runnable接口的run()方法是没有返回值的，所以 `submit(Runnable task)` 这个方法返回的Future仅可以用来断言任务已经结束了，类似于Thread.join()
+2. 提交Callable任务 `submit(Callable<T> task)`：这个方法的参数是一个Callable接口，它只有一个call()方法，并且这个方法是有返回值的，所以这个方法返回的Future对象可以通过调用其get()方法来获取任务的执行结果
+3. 提交Runnable任务及结果引用 `submit(Runnable task, T result)`：这个方法很有意思，假设这个方法返回的Future对象是f，f.get()的返回值就是传给submit()方法的参数result需要你注意的是Runnable接口的实现类Task声明了一个有参构造函数 `Task(Result r)` ，创建Task对象的时候传入了result对象，这样就能在类Task的run()方法中对result进行各种操作了。result相当于主线程和子线程之间的桥梁，通过它主子线程可以共享数据。
+
+```java
+ExecutorService executor = Executors.newFixedThreadPool(1); 
+// 创建Result对象r 
+Result r = new Result(); 
+r.setAAA(a); 
+// 提交任务 Future 
+future = executor.submit(new Task®, r);
+Result fr = future.get(); 
+// 下面等式成立 fr === r; fr.getAAA() === a; fr.getXXX() === x
+
+class Task implements Runnable{ 
+    Result r; //通过构造函数传入result 
+    
+    Task(Result r){
+		this.r = r;
+	} 
+    void run() {
+    	//可以操作result
+    	a = r.getAAA();
+    	r.setXXX(x);
+	} 
+}
+
+```
+
+Future是一个接口，而FutureTask是一个实实在在的工具类，这个工具类有两个构造函数
+
+```java
+FutureTask(Callable<V> callable);
+FutureTask(Runnable runnable, V result);
+```
+
+FutureTask实现了Runnable和Future接口，由于实现了Runnable接口，所以可以将FutureTask对象作为任务提交给ThreadPoolExecutor去执行，也可以直接被Thread执行；又因为实现了Future接口，所以也能用来获得任务的执行结果
+
+```java
+// 创建FutureTask
+FutureTask<Integer> futureTask
+  = new FutureTask<>(()-> 1+2);
+// 创建线程池
+ExecutorService es = 
+  Executors.newCachedThreadPool();
+// 提交FutureTask 
+es.submit(futureTask);
+// 获取计算结果
+Integer result = futureTask.get();
+```
+
+利用FutureTask对象可以很容易获取子线程的执行结果
+
+```java
+// 创建FutureTask
+FutureTask<Integer> futureTask
+  = new FutureTask<>(()-> 1+2);
+// 创建并启动线程
+Thread T1 = new Thread(futureTask);
+T1.start();
+// 获取计算结果
+Integer result = futureTask.get();
+```
+
+## 实现最优的 烧水泡茶程序
+
+![image-20250417182822922](image\image-20250417182822922.png)
+
+发编程可以总结为三个核心问题：分工、同步和互斥。编写并发程序，首先要做的就是分工，所谓分工指的是如何高效地拆解任务并分配给线程。对于烧水泡茶这个程序，一种最优的分工方案可以是下图所示的这样：用两个线程T1和T2来完成烧水泡茶程序，T1负责洗水壶、烧开水、泡茶这三道工序，T2负责洗茶壶、洗茶杯、拿茶叶三道工序，其中T1在执行泡茶这道工序时需要等待T2完成拿茶叶的工序
+
+
+
+对于T1的这个等待动作，你应该可以想出很多种办法，例如Thread.join()、CountDownLatch，甚至阻塞队列都可以解决，不过今天我们用Future特性来实现
+
+
+
+创建了两个FutureTask——ft1和ft2，ft1完成洗水壶、烧开水、泡茶的任务，ft2完成洗茶壶、洗茶杯、拿茶叶的任务；这里需要注意的是ft1这个任务在执行泡茶任务前，需要等待ft2把茶叶拿来，所以ft1内部需要引用ft2，并在执行泡茶之前，调用ft2的get()方法实现等待。
+
+```java
+// 创建任务T2的FutureTask
+FutureTask<String> ft2
+  = new FutureTask<>(new T2Task());
+// 创建任务T1的FutureTask
+FutureTask<String> ft1
+  = new FutureTask<>(new T1Task(ft2));
+
+// 线程T1执行任务ft1
+Thread T1 = new Thread(ft1);
+T1.start();
+// 线程T2执行任务ft2
+Thread T2 = new Thread(ft2);
+T2.start();
+// 等待线程T1执行结果
+System.out.println(ft1.get());
+
+// T1Task需要执行的任务：
+// 洗水壶、烧开水、泡茶
+class T1Task implements Callable<String>{
+  FutureTask<String> ft2;
+  // T1任务需要T2任务的FutureTask
+  T1Task(FutureTask<String> ft2){
+    this.ft2 = ft2;
+  }
+  @Override
+  String call() throws Exception {
+    System.out.println("T1:洗水壶...");
+    TimeUnit.SECONDS.sleep(1);
+
+    System.out.println("T1:烧开水...");
+    TimeUnit.SECONDS.sleep(15);
+    // 获取T2线程的茶叶  
+    String tf = ft2.get();
+    System.out.println("T1:拿到茶叶:"+tf);
+
+    System.out.println("T1:泡茶...");
+    return "上茶:" + tf;
+  }
+}
+// T2Task需要执行的任务:
+// 洗茶壶、洗茶杯、拿茶叶
+class T2Task implements Callable<String> {
+  @Override
+  String call() throws Exception {
+    System.out.println("T2:洗茶壶...");
+    TimeUnit.SECONDS.sleep(1);
+
+    System.out.println("T2:洗茶杯...");
+    TimeUnit.SECONDS.sleep(2);
+
+    System.out.println("T2:拿茶叶...");
+    TimeUnit.SECONDS.sleep(1);
+    return "龙井";
+  }
+}
+// 一次执行结果：
+T1:洗水壶...
+T2:洗茶壶...
+T1:烧开水...
+T2:洗茶杯...
+T2:拿茶叶...
+T1:拿到茶叶:龙井
+T1:泡茶...
+上茶:龙井
+```
+
+利用多线程可以快速将一些串行的任务并行化，从而提高性能；如果任务之间有依赖关系，比如当前任务依赖前一个任务的执行结果，这种问题基本上都可以用Future来解决。在分析这种问题的过程中，建议你用有向图描述一下任务之间的依赖关系，同时将线程的分工也做好
+

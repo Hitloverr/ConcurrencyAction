@@ -1,4 +1,4 @@
-package com.example.basic;
+package java.com.example.basic;
 
 public class TestSingleObject {
     private TestSingleObject() {}

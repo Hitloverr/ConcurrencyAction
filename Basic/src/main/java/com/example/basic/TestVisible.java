@@ -1,4 +1,4 @@
-package com.example.basic;
+package java.com.example.basic;
 
 public class TestVisible {
     private static int count = 0;

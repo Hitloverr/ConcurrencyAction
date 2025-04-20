@@ -2512,7 +2512,9 @@ static <U> CompletableFuture<U>
 
 一个是异步操作什么时候结束，另一个是如何获取异步操作的执行结果。因为CompletableFuture类实现了Future接口，所以这两个问题你都可以通过Future接口来解决
 
-## CompletionStage接口
+# CompletionStage接口
+
+
 
 **串行关系、并行关系、汇聚关系**。洗水壶和烧开水就是串行关系，洗水壶、烧开水和洗茶壶、洗茶杯这两组任务之间就是并行关系，而烧开水、拿茶叶和泡茶就是汇聚关系。
 
@@ -2628,4 +2630,234 @@ CompletableFuture<Integer>
     .exceptionally(e->0);
 System.out.println(f0.join());
 ```
+
+# ForkJoin：单机版本的MapReduce
+
+简单的并行任务：线程池 + Future
+
+任务之间有聚合关系：AND OR-> CompletableFuture
+
+批量的并行任务：CompletionService
+
+
+
+![image-20250420150937284](image\image-20250420150937284.png)
+
+> 简单并行任务 聚合任务 批量并行任务
+
+分治：归并排序 快速排序 二分查找 MapReduce
+
+## 分治任务模型
+
+任务分解： 任务迭代地分解成子任务，直到获取最终结果
+
+结果合并：逐层合并子任务的执行结果。
+
+相似性：任务和子任务的算法相同，但是计算的数据规模不同
+
+## ForkJoin的使用
+
+- 分治任务的线程池ForkJoinPool
+- 分治任务：ForkJoinTask【fork() join()】:子类有RecursiveAction RecursiveTask，前者没有返回值，后者有。
+
+```java
+ public static void main(String[] args) {
+        ForkJoinPool forkJoinPool = new ForkJoinPool(4);
+        Fibonacci fibonacci = new Fibonacci(30);
+        Integer result = forkJoinPool.invoke(fibonacci);
+        System.out.println(result);
+
+    }
+
+    private static class Fibonacci extends RecursiveTask<Integer> {
+        final int n;
+
+        Fibonacci(int n) {
+            this.n = n;
+        }
+        @Override
+        protected Integer compute() {
+            if (n <= 1) {
+                return n;
+            }
+            Fibonacci f1 = new Fibonacci(n - 1);
+            f1.fork();// 使用了异步子任务。
+            Fibonacci f2 = new Fibonacci(n - 2);
+            f2.fork();
+            return f1.join() + f2.join();
+        }
+    }
+```
+
+## ForkJoinPool工作原理
+
+ThreadPoolExecutor内部只有一个任务队列，而ForkJoinPool内部有多个任务队列，当我们通过ForkJoinPool的invoke()或者submit()方法提交任务时，ForkJoinPool根据一定的路由规则把任务提交到一个任务队列中，如果任务在执行过程中会创建出子任务，那么子任务会提交到工作线程对应的任务队列中。
+
+“任务窃取”机制：工作线程空闲了就可以窃取其他工作任务队列里面的任务。队列是双端队列，工作线程正常获取任务 和 窃取任务 分别是从任务队列不用端消费。
+
+![image-20250420152029587](image\image-20250420152029587.png)
+
+## 模拟MapReduce统计单词数量
+
+统计一个文件里面每个单词的数量：可以先用二分法递归地将一个文件拆分成更小的文件，直到文件里只有一行数据，然后统计这一行数据里单词的数量，最后再逐级汇总结果。
+
+用一个字符串数组 `String[] fc` 来模拟文件内容，fc里面的元素与文件里面的行数据一一对应。关键的代码在 `compute()` 这个方法里面，这是一个递归方法，前半部分数据fork一个递归任务去处理（关键代码mr1.fork()），后半部分数据则在当前任务中递归处理（mr2.compute()）
+
+```java
+class ForkJoinTest2 {
+    public static void main(String[] args) {
+        String[] fc = {"hello world",
+                "hello me",
+                "hello fork",
+                "hello join",
+                "fork join in world"};
+        ForkJoinPool forkJoinPool = new ForkJoinPool(3);
+        MR mr = new MR(fc, 0, fc.length);
+        Map<String, Long> result = forkJoinPool.invoke(mr);
+        System.out.println(result);
+    }
+
+    static class MR extends RecursiveTask<Map<String,Long>> {
+        private String[] fc;
+        private int start,end;
+
+        MR(String[] fc, int start, int end) {
+            this.fc = fc;
+            this.start = start;
+            this.end = end;
+        }
+        @Override
+        protected Map<String, Long> compute() {
+            if (end - start == 1) {
+                return calc(fc[start]);
+            }
+            int mid = (start + end) / 2;
+            MR mr1 = new MR(fc, start, mid);
+            mr1.fork();
+            MR mr2 = new MR(fc,mid,end);
+            mr2.fork();
+            return merge(mr1.join(), mr2.join());
+        }
+
+        private Map<String, Long> merge(Map<String, Long> m1, Map<String, Long> m2) {
+            Map<String,Long> result = new HashMap<>();
+            result.putAll(m1);
+            m2.forEach((k,v) -> {
+                if (result.containsKey(k)) {
+                    result.put(k,result.get(k) + v);
+                } else {
+                    result.put(k, v);
+                }
+            });
+            return result;
+        }
+
+        private Map<String, Long> calc(String line) {
+            Map<String, Long> result = new HashMap<>();
+            String[] words = line.split("\\s+");
+            for (String word : words) {
+                result.put(word, result.getOrDefault(word,0l) + 1);
+            }
+            return result;
+        }
+    }
+}
+```
+
+## 总结扩展
+
+Java Stream并行流也是以ForkJoinPool为基础。不过要注意，默认并行流共享一个ForkJoinPool，默认是CPU核数。如果所有并行流都是CPU密集任务，没有问题，但是如果有IO密集型的并行流计算，很可能因为一个很慢的IO计算拖慢整个系统的性能。
+
+建议用不同的ForkJoinPool执行不同类型的计算任务。
+
+
+
+# 并发工具类模块答疑
+
+1. 转账的功能代码：
+
+   ```java
+   import java.util.concurrent.locks.Lock;
+   import java.util.concurrent.locks.ReentrantLock;
+   
+   class Account {
+       private int balance;
+       private final Lock lock = new ReentrantLock();
+   
+       // 转账
+       void transfer(Account tar, int amt) throws InterruptedException {
+           while (true) {
+               if (this.lock.tryLock()) {
+                   try {
+                       System.out.println("当前对象的锁已获取");
+                       if (tar.lock.tryLock()) {
+                           try {
+                               System.out.println("目标对象的锁已获取");
+                               this.balance -= amt;
+                               tar.balance += amt;
+                               System.out.println("转账完成，准备跳出循环");
+                               // 新增：退出循环
+                               break;
+                           } finally {
+                               System.out.println("释放目标对象的锁");
+                               tar.lock.unlock();
+                           }
+                       }
+                   } finally {
+                       System.out.println("释放当前对象的锁");
+                       this.lock.unlock();
+                   }
+               }
+               // 新增：sleep一个随机时间避免活锁. 避免线程A 账户A到B转账，现成B 账户B到账户A转账，一直冲突获取不到锁。
+               Thread.sleep((long) (Math.random() * 100));
+           }
+       }
+   }
+   ```
+
+   
+
+2. WM
+
+```java
+public class SafeWM {
+  class WMRange{
+    final int upper;
+    final int lower;
+    WMRange(int upper,int lower){
+    //省略构造函数实现
+    }
+  }
+  final AtomicReference<WMRange>
+    rf = new AtomicReference<>(
+      new WMRange(0,0)
+    );
+  // 设置库存上限
+  void setUpper(int v){
+    WMRange nr;
+    WMRange or;
+    //原代码在这里
+    //WMRange or=rf.get();
+    do{
+      //移动到此处
+      //每个回合都需要重新获取旧值
+      or = rf.get();
+      // 检查参数合法性
+      if(v < or.lower){
+        throw new IllegalArgumentException();
+      }
+      nr = new
+        WMRange(v, or.lower);
+    }while(!rf.compareAndSet(or, nr));
+  }
+}
+```
+
+当遇到回调函数的时候，你应该本能地问自己：执行回调函数的线程是哪一个？这个在多线程场景下非常重要。因为不同线程ThreadLocal里的数据是不同的，有些框架比如Spring就用ThreadLocal来管理事务，如果不清楚回调函数用的是哪个线程，很可能会导致错误的事务管理，并最终导致数据不一致。
+
+CyclicBarrier的回调函数究竟是哪个线程执行的呢？如果你分析源码，你会发现执行回调函数的线程是将CyclicBarrier内部计数器减到 0 的那个线程。
+
+
+
+# Immutability模式：利用不变性解决并发问题
 

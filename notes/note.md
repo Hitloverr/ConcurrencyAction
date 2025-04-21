@@ -3040,3 +3040,100 @@ public class SafeWM {
 ```
 
 不可变性的另外一种形式是：无状态对象内部没有属性，只有方法。除了无状态的对象，你可能还听说过无状态的服务、无状态的协议等等。无状态有很多好处，最核心的一点就是性能。在多线程领域，无状态对象没有线程安全问题，无需同步处理，自然性能很好；在分布式领域，无状态意味着可以无限地水平扩展，所以分布式领域里面性能的瓶颈一定不是出在无状态的服务节点上。
+
+# 写时复制技术
+
+## 应用领域
+
+CopyOnWriteArrayList和CopyOnWriteArraySet。读操作是无锁的，由于无锁，所以将读操作的性能发挥到了极致。
+
+Linux中的fork()函数就聪明得多了，fork()子进程的时候，并不复制整个进程的地址空间，而是让父子进程共享同一个地址空间；只用在父进程或者子进程需要写入的时候才会复制地址空间，从而使父子进程拥有各自的地址空间。
+
+本质上来讲，父子进程的地址空间以及数据都是要隔离的，使用Copy-on-Write更多地体现的是一种**延时策略，只有在真正需要复制的时候才复制，而不是提前复制好**，同时Copy-on-Write还支持按需复制，所以Copy-on-Write在操作系统领域是能够提升性能的
+
+
+
+在操作系统领域，除了创建进程用到了Copy-on-Write，很多文件系统也同样用到了，例如Btrfs (B-Tree File System)、aufs（advanced multi-layered unification filesystem）等。
+
+除了上面我们说的Java领域、操作系统领域，很多其他领域也都能看到Copy-on-Write的身影：Docker容器镜像的设计是Copy-on-Write，甚至分布式源码管理系统Git背后的设计思想都有Copy-on-Write……
+
+
+
+**Copy-on-Write最大的应用领域还是在函数式编程领域**。函数式编程的基础是不可变性（Immutability），所以函数式编程里面所有的修改操作都需要Copy-on-Write来解决。
+
+
+
+CopyOnWriteArrayList和CopyOnWriteArraySet这两个Copy-on-Write容器在修改的时候会复制整个数组，所以如果容器经常被修改或者这个数组本身就非常大的时候，是不建议使用的。反之，如果是修改非常少、数组数量也不大，并且对读性能要求苛刻的场景，使用Copy-on-Write容器效果就非常好了
+
+## 一个真实案例
+
+服务提供方是多实例分布式部署的，所以服务的客户端在调用RPC的时候，会选定一个服务实例来调用，这个选定的过程本质上就是在做负载均衡，而做负载均衡的前提是客户端要有全部的路由信息。例如在下图中，A服务的提供方有3个实例，分别是192.168.1.1、192.168.1.2和192.168.1.3，客户端在调用目标服务A前，首先需要做的是负载均衡，也就是从这3个实例中选出1个来，然后再通过RPC把请求发送选中的目标实例。
+
+![image-20250421214808273](image\image-20250421214808273.png)
+
+RPC框架的一个核心任务就是维护服务的路由关系，我们可以把服务的路由关系简化成下图所示的路由表。当服务提供方上线或者下线的时候，就需要更新客户端的这张路由表。
+
+![image-20250421214836481](image\image-20250421214836481.png)
+
+每次RPC调用都需要通过负载均衡器来计算目标服务的IP和端口号，而负载均衡器需要通过路由表获取接口的所有路由信息，也就是说，每次RPC调用都需要访问路由表，所以访问路由表这个操作的性能要求是很高的。不过路由表对数据的一致性要求并不高，一个服务提供方从上线到反馈到客户端的路由表里，即便有5秒钟，很多时候也都是能接受的（5秒钟，对于以纳秒作为时钟周期的CPU来说，那何止是一万年，所以路由表对一致性的要求并不高）。而且路由表是典型的读多写少类问题
+
+
+
+对读的性能要求很高，读多写少，弱一致性。它们综合在一起，你会想到什么呢？CopyOnWriteArrayList和CopyOnWriteArraySet天生就适用这种场景啊。
+
+服务提供方的每一次上线、下线都会更新路由信息，这时候你有两种选择。一种是通过更新Router的一个状态位来标识，如果这样做，那么所有访问该状态位的地方都需要同步访问，这样很影响性能。另外一种就是采用Immutability模式，每次上线、下线都创建新的Router对象或者删除对应的Router对象。由于上线、下线的频率很低，所以后者是最好的选择。
+
+```java
+//路由信息
+public final class Router{
+  private final String  ip;
+  private final Integer port;
+  private final String  iface;
+  //构造函数
+  public Router(String ip, 
+      Integer port, String iface){
+    this.ip = ip;
+    this.port = port;
+    this.iface = iface;
+  }
+  //重写equals方法
+  public boolean equals(Object obj){
+    if (obj instanceof Router) {
+      Router r = (Router)obj;
+      return iface.equals(r.iface) &&
+             ip.equals(r.ip) &&
+             port.equals(r.port);
+    }
+    return false;
+  }
+  public int hashCode() {
+    //省略hashCode相关代码
+  }
+}
+//路由表信息
+public class RouterTable {
+  //Key:接口名
+  //Value:路由集合
+  ConcurrentHashMap<String, CopyOnWriteArraySet<Router>> 
+    rt = new ConcurrentHashMap<>();
+  //根据接口名获取路由表
+  public Set<Router> get(String iface){
+    return rt.get(iface);
+  }
+  //删除路由
+  public void remove(Router router) {
+    Set<Router> set=rt.get(router.iface);
+    if (set != null) {
+      set.remove(router);
+    }
+  }
+  //增加路由
+  public void add(Router router) {
+    Set<Router> set = rt.computeIfAbsent(
+      route.iface, r -> 
+        new CopyOnWriteArraySet<>());
+    set.add(router);
+  }
+}
+```
+

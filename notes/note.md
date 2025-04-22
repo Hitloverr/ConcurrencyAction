@@ -3137,3 +3137,119 @@ public class RouterTable {
 }
 ```
 
+# 线程本地存储模式
+
+## ThreadLocal的使用方法：
+
+```java
+static class ThreadId {
+  static final AtomicLong 
+  nextId=new AtomicLong(0);
+  //定义ThreadLocal变量
+  static final ThreadLocal<Long> 
+  tl=ThreadLocal.withInitial(
+    ()->nextId.getAndIncrement());
+  //此方法会为每个线程分配一个唯一的Id
+  static long get(){
+    return tl.get();
+  }
+}
+```
+
+不同线程调用SafeDateFormat的get()方法将返回不同的SimpleDateFormat对象实例，由于不同线程并不共享SimpleDateFormat，所以就像局部变量一样，是线程安全的。
+
+```java
+static class SafeDateFormat {
+  //定义ThreadLocal变量
+  static final ThreadLocal<DateFormat>
+  tl=ThreadLocal.withInitial(
+    ()-> new SimpleDateFormat(
+      "yyyy-MM-dd HH:mm:ss"));
+
+  static DateFormat get(){
+    return tl.get();
+  }
+}
+//不同线程执行下面代码
+//返回的df是不同的
+DateFormat df =
+  SafeDateFormat.get()；
+```
+
+## ThreadLocal工作原理
+
+数据是存储在Thread线程对象中，threadLocals： ThreadLocalMap类型
+
+![image-20250422205209537](image\image-20250422205209537.png)
+
+```java
+class Thread {
+  //内部持有ThreadLocalMap
+  ThreadLocal.ThreadLocalMap 
+    threadLocals;
+}
+class ThreadLocal<T>{
+  public T get() {
+    //首先获取线程持有的
+    //ThreadLocalMap
+    ThreadLocalMap map =
+      Thread.currentThread()
+        .threadLocals;
+    //在ThreadLocalMap中
+    //查找变量
+    Entry e = 
+      map.getEntry(this);
+    return e.value;  
+  }
+  static class ThreadLocalMap{
+    //内部是数组而不是Map
+    Entry[] table;
+    //根据ThreadLocal查找Entry
+    Entry getEntry(ThreadLocal key){
+      //省略查找逻辑
+    }
+    //Entry定义
+    static class Entry extends
+    WeakReference<ThreadLocal>{
+      Object value;
+    }
+  }
+}
+```
+
+在Java的实现方案里面，ThreadLocal仅仅是一个代理工具类，内部并不持有任何与线程相关的数据，所有和线程相关的数据都存储在Thread里面，这样的设计容易理解。而从数据的亲缘性上来讲，ThreadLocalMap属于Thread也更加合理.
+
+Java的实现中Thread持有ThreadLocalMap，而且ThreadLocalMap里对ThreadLocal的引用还是弱引用（WeakReference），所以只要Thread对象可以被回收，那么ThreadLocalMap就能被回收
+
+## ThreadLocal与内存泄漏
+
+在线程池中使用ThreadLocal为什么可能导致内存泄露呢？原因就出在线程池中线程的存活时间太长，往往都是和程序同生共死的，这就意味着Thread持有的ThreadLocalMap一直都不会被回收，再加上ThreadLocalMap中的Entry对ThreadLocal是弱引用（WeakReference），所以只要ThreadLocal结束了自己的生命周期是可以被回收掉的。但是Entry中的Value却是被Entry强引用的，所以即便Value的生命周期结束了，Value也是无法被回收的，从而导致内存泄露。
+
+
+
+解决方案：手动释放
+
+```java
+ExecutorService es;
+ThreadLocal tl;
+es.execute(()->{
+  //ThreadLocal增加变量
+  tl.set(obj);
+  try {
+    // 省略业务逻辑代码
+  }finally {
+    //手动清理ThreadLocal 
+    tl.remove();
+  }
+});
+```
+
+## InheritableThreadLocal
+
+需要子线程继承父线程的线程变量，Java提供了InheritableThreadLocal来支持这种特性
+
+可能导致内存泄露，更重要的原因是：线程池中线程的创建是动态的，很容易导致继承关系错乱，如果你的业务逻辑依赖InheritableThreadLocal，那么很可能导致业务逻辑计算错误，而这个错误往往比内存泄露更要命。
+
+## 总结
+
+一种方案是将这个工具类作为局部变量使用，另外一种方案就是线程本地存储模式。这两种方案，局部变量方案的缺点是在高并发场景下会频繁创建对象，而线程本地存储方案，每个线程只需要创建一个工具类的实例，所以不存在频繁创建对象的问题。

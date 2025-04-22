@@ -3253,3 +3253,191 @@ es.execute(()->{
 ## 总结
 
 一种方案是将这个工具类作为局部变量使用，另外一种方案就是线程本地存储模式。这两种方案，局部变量方案的缺点是在高并发场景下会频繁创建对象，而线程本地存储方案，每个线程只需要创建一个工具类的实例，所以不存在频繁创建对象的问题。
+
+# Guarded Suspension模式：等待唤醒
+
+![image-20250422205739156](image\image-20250422205739156.png)
+
+用户通过浏览器发过来一个请求，会被转换成一个异步消息发送给MQ，等MQ返回结果后，再将这个结果返回至浏览器。小灰同学的问题是：给MQ发送消息的线程是处理Web请求的线程T1，但消费MQ结果的线程并不是线程T1，那线程T1如何等待MQ的返回结果呢
+
+```java
+class Message{
+  String id;
+  String content;
+}
+//该方法可以发送消息
+void send(Message msg){
+  //省略相关代码
+}
+//MQ消息返回后会调用该方法
+//该方法的执行线程不同于
+//发送消息的线程
+void onMessage(Message msg){
+  //省略相关代码
+}
+//处理浏览器发来的请求
+Respond handleWebReq(){
+  //创建一消息
+  Message msg1 = new 
+    Message("1","{...}");
+  //发送消息
+  send(msg1);
+  //如何等待MQ返回的消息呢？
+  String result = ...;
+}
+```
+
+## Guarded Suspension模式
+
+Guarded Suspension模式的结构图，非常简单，一个对象GuardedObject，内部有一个成员变量——受保护的对象，以及两个成员方法——`get(Predicate<T> p)`和`onChanged(T obj)`方法。
+
+![image-20250422205900781](image\image-20250422205900781.png)
+
+```java
+class GuardedObject<T>{
+  //受保护的对象
+  T obj;
+  final Lock lock = 
+    new ReentrantLock();
+  final Condition done =
+    lock.newCondition();
+  final int timeout=1;
+  //获取受保护对象  
+  T get(Predicate<T> p) {
+    lock.lock();
+    try {
+      //MESA管程推荐写法
+      while(!p.test(obj)){
+        done.await(timeout, 
+          TimeUnit.SECONDS);
+      }
+    }catch(InterruptedException e){
+      throw new RuntimeException(e);
+    }finally{
+      lock.unlock();
+    }
+    //返回非空的受保护对象
+    return obj;
+  }
+  //事件通知方法
+  void onChanged(T obj) {
+    lock.lock();
+    try {
+      this.obj = obj;
+      done.signalAll();
+    } finally {
+      lock.unlock();
+    }
+  }
+}
+```
+
+## 扩展Guarded Suspension模式
+
+Guarded Suspension模式里GuardedObject有两个核心方法，一个是get()方法，一个是onChanged()方法。很显然，在处理Web请求的方法handleWebReq()中，可以调用GuardedObject的get()方法来实现等待；在MQ消息的消费方法onMessage()中，可以调用GuardedObject的onChanged()方法来实现唤醒。
+
+```java
+//处理浏览器发来的请求
+Respond handleWebReq(){
+  //创建一消息
+  Message msg1 = new 
+    Message("1","{...}");
+  //发送消息
+  send(msg1);
+  //利用GuardedObject实现等待
+  GuardedObject<Message> go
+    =new GuardObjec<>();
+  Message r = go.get(
+    t->t != null);
+}
+void onMessage(Message msg){
+  //如何找到匹配的go？
+  GuardedObject<Message> go=???
+  go.onChanged(msg);
+}
+```
+
+扩展Guarded Suspension模式的实现，扩展后的GuardedObject内部维护了一个Map，其Key是MQ消息id，而Value是GuardedObject对象实例，同时增加了静态方法create()和fireEvent()；create()方法用来创建一个GuardedObject对象实例，并根据key值将其加入到Map中，而fireEvent()方法则是模拟的大堂经理根据包间找就餐人的逻辑。
+
+```java
+class GuardedObject<T>{
+  //受保护的对象
+  T obj;
+  final Lock lock = 
+    new ReentrantLock();
+  final Condition done =
+    lock.newCondition();
+  final int timeout=2;
+  //保存所有GuardedObject
+  final static Map<Object, GuardedObject> 
+  gos=new ConcurrentHashMap<>();
+  //静态方法创建GuardedObject
+  static <K> GuardedObject 
+      create(K key){
+    GuardedObject go=new GuardedObject();
+    gos.put(key, go);
+    return go;
+  }
+  static <K, T> void 
+      fireEvent(K key, T obj){
+    GuardedObject go=gos.remove(key);
+    if (go != null){
+      go.onChanged(obj);
+    }
+  }
+  //获取受保护对象  
+  T get(Predicate<T> p) {
+    lock.lock();
+    try {
+      //MESA管程推荐写法
+      while(!p.test(obj)){
+        done.await(timeout, 
+          TimeUnit.SECONDS);
+      }
+    }catch(InterruptedException e){
+      throw new RuntimeException(e);
+    }finally{
+      lock.unlock();
+    }
+    //返回非空的受保护对象
+    return obj;
+  }
+  //事件通知方法
+  void onChanged(T obj) {
+    lock.lock();
+    try {
+      this.obj = obj;
+      done.signalAll();
+    } finally {
+      lock.unlock();
+    }
+  }
+}
+```
+
+
+
+```java
+//处理浏览器发来的请求
+Respond handleWebReq(){
+  int id=序号生成器.get();
+  //创建一消息
+  Message msg1 = new 
+    Message(id,"{...}");
+  //创建GuardedObject实例
+  GuardedObject<Message> go=
+    GuardedObject.create(id);  
+  //发送消息
+  send(msg1);
+  //等待MQ消息
+  Message r = go.get(
+    t->t != null);  
+}
+void onMessage(Message msg){
+  //唤醒等待的线程
+  GuardedObject.fireEvent(
+    msg.id, msg);
+}
+```
+
+Guarded Suspension模式也常被称作Guarded Wait模式、Spin Lock模式（因为使用了while循环去等待），这些名字都很形象，不过它还有一个更形象的非官方名字：多线程版本的if。单线程场景中，if语句是不需要等待的，因为在只有一个线程的条件下，如果这个线程被阻塞，那就没有其他活动线程了，这意味着if判断条件的结果也不会发生变化了。但是多线程场景中，等待就变得有意义了，这种场景下，if判断条件的结果是可能发生变化的。

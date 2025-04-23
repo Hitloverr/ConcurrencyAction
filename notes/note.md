@@ -3441,3 +3441,211 @@ void onMessage(Message msg){
 ```
 
 Guarded Suspension模式也常被称作Guarded Wait模式、Spin Lock模式（因为使用了while循环去等待），这些名字都很形象，不过它还有一个更形象的非官方名字：多线程版本的if。单线程场景中，if语句是不需要等待的，因为在只有一个线程的条件下，如果这个线程被阻塞，那就没有其他活动线程了，这意味着if判断条件的结果也不会发生变化了。但是多线程场景中，等待就变得有意义了，这种场景下，if判断条件的结果是可能发生变化的。
+
+# Balking模式：再谈线程安全的单例模式
+
+一个例子：编辑器提供的自动保存功能，如果文件做出了修改，就自动定时保存。
+
+```java
+class AutoSaveEditor{
+  //文件是否被修改过
+  boolean changed=false;
+  //定时任务线程池
+  ScheduledExecutorService ses = 
+    Executors.newSingleThreadScheduledExecutor();
+  //定时执行自动保存
+  void startAutoSave(){
+    ses.scheduleWithFixedDelay(()->{
+      autoSave();
+    }, 5, 5, TimeUnit.SECONDS);  
+  }
+  //自动存盘操作
+  void autoSave(){
+    if (!changed) {
+      return;
+    }
+    changed = false;
+    //执行存盘操作
+    //省略且实现
+    this.execSave();
+  }
+  //编辑操作
+  void edit(){
+    //省略编辑逻辑
+    ......
+    changed = true;
+  }
+}
+```
+
+有问题，因为对changed的读写没有进行同步，不线程安全，修改：
+
+```java
+//自动存盘操作
+void autoSave(){
+  synchronized(this){
+    if (!changed) {
+      return;
+    }
+    changed = false;
+  }
+  //执行存盘操作
+  //省略且实现
+  this.execSave();
+}
+//编辑操作
+void edit(){
+  //省略编辑逻辑
+  ......
+  synchronized(this){
+    changed = true;
+  }
+}  
+```
+
+示例中的共享变量是一个状态变量，业务逻辑依赖于这个状态变量的状态。多线程版本的if
+
+## Balking模式的经典实现
+
+```java
+boolean changed=false;
+//自动存盘操作
+void autoSave(){
+  synchronized(this){
+    if (!changed) {
+      return;
+    }
+    changed = false;
+  }
+  //执行存盘操作
+  //省略且实现
+  this.execSave();
+}
+//编辑操作
+void edit(){
+  //省略编辑逻辑
+  ......
+  change();
+}
+//改变状态
+void change(){
+  synchronized(this){
+    changed = true;
+  }
+}
+```
+
+## 用volatile实现Balking模式
+
+前面是Synchronized实现Balking模式，也可以用volatile（对原子性没有要求）
+
+1. 对共享变量changed和rt的写操作不存在原子性的要求。
+2. 同一时刻只有一个线程执行autoSave方法
+
+```java
+//路由表信息
+public class RouterTable {
+  //Key:接口名
+  //Value:路由集合
+  ConcurrentHashMap<String, CopyOnWriteArraySet<Router>> 
+    rt = new ConcurrentHashMap<>();    
+  //路由表是否发生变化
+  volatile boolean changed;
+  //将路由表写入本地文件的线程池
+  ScheduledExecutorService ses=
+    Executors.newSingleThreadScheduledExecutor();
+  //启动定时任务
+  //将变更后的路由表写入本地文件
+  public void startLocalSaver(){
+    ses.scheduleWithFixedDelay(()->{
+      autoSave();
+    }, 1, 1, MINUTES);
+  }
+  //保存路由表到本地文件
+  void autoSave() {
+    if (!changed) {
+      return;
+    }
+    changed = false;
+    //将路由表写入本地文件
+    //省略其方法实现
+    this.save2Local();
+  }
+  //删除路由
+  public void remove(Router router) {
+    Set<Router> set=rt.get(router.iface);
+    if (set != null) {
+      set.remove(router);
+      //路由表已发生变化
+      changed = true;
+    }
+  }
+  //增加路由
+  public void add(Router router) {
+    Set<Router> set = rt.computeIfAbsent(
+      route.iface, r -> 
+        new CopyOnWriteArraySet<>());
+    set.add(router);
+    //路由表已发生变化
+    changed = true;
+  }
+}
+```
+
+一个常见的例子：单次初始化。
+
+```java
+public class InitTest {
+    boolean inited = false;   
+    synchronized void init() {
+        if (inited) {
+            return;
+        }
+        //doSthToInit
+        inited = true;
+    }
+}
+```
+
+线程安全的单例模式实质上也是这样的：
+
+```java
+class Singleton{
+  private static
+    Singleton singleton;
+  //构造方法私有化  
+  private Singleton(){}
+  //获取实例（单例）
+  public synchronized static 
+  Singleton getInstance(){
+    if(singleton == null){
+      singleton=new Singleton();
+    }
+    return singleton;
+  }
+}
+```
+
+优化方案：双重检查方法
+
+```java
+class SingleObject {
+    private SingleObject() {}
+    
+    // 避免获取为空
+    private static volatile SingleObject INSTANCE;
+    
+    public static SingleObject getInstance() {
+        if (INSTANCE == null) {
+            synchronized (SingleObject.class) {
+                if (INSTANCE == null) {
+                    // 有三步。
+                    INSTANCE = new SingleObject();
+                }
+            }
+        }
+        return INSTANCE;
+    }
+}
+```
+

@@ -1,5 +1,9 @@
 package com.example.basic;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.channels.ServerSocketChannel;
+
 public class InitTest {
     boolean inited = false;
 
@@ -28,5 +32,12 @@ class SingleObject {
             }
         }
         return INSTANCE;
+    }
+}
+
+class WebServerTest {
+    final ServerSocketChannel serverSocketChannel = ServerSocketChannel.open().bind(new InetSocketAddress(8080));
+
+    WebServerTest() throws IOException {
     }
 }

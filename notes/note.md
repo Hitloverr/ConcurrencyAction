@@ -3649,3 +3649,126 @@ class SingleObject {
 }
 ```
 
+# Thread-Per-Message模式：分工
+
+## 如何理解？
+
+委托，比如HTTP Server中，主线程只能接收请求，但不能处理HTTP请求。可以创建子线程，委托子线程处理HTTP请求。总结就是为每一个任务分配一个独立的线程
+
+## 用Thread实现Thread-Per-Message模式
+
+Thread-Per-Message模式的一个最经典的应用场景是**网络编程里服务端的实现**，服务端为每个客户端请求创建一个独立的线程，当线程处理完请求后，自动销毁，这是一种最简单的并发处理网络请求的方法。
+
+```java
+final ServerSocketChannel  = 
+  ServerSocketChannel.open().bind(
+    new InetSocketAddress(8080));
+//处理请求    
+try {
+  while (true) {
+    // 接收请求
+    SocketChannel sc = ssc.accept();
+    // 每个请求都创建一个线程
+    new Thread(()->{
+      try {
+        // 读Socket
+        ByteBuffer rb = ByteBuffer
+          .allocateDirect(1024);
+        sc.read(rb);
+        //模拟处理请求
+        Thread.sleep(2000);
+        // 写Socket
+        ByteBuffer wb = 
+          (ByteBuffer)rb.flip();
+        sc.write(wb);
+        // 关闭Socket
+        sc.close();
+      }catch(Exception e){
+        throw new UncheckedIOException(e);
+      }
+    }).start();
+  }
+} finally {
+  ssc.close();
+}   
+```
+
+Java中的线程是一个重量级的对象，创建成本很高，一方面创建线程比较耗时，另一方面线程占用的内存也比较大。所以，为每个请求创建一个新的线程并不适合高并发场景。这时候很可能你会想到Java提供的线程池。你的这个思路没有问题，但是引入线程池难免会增加复杂度
+
+Java语言里，Java线程是和操作系统线程一一对应的，这种做法本质上是将Java线程的调度权完全委托给操作系统，而操作系统在这方面非常成熟，所以这种做法的好处是稳定、可靠，但是也继承了操作系统线程的缺点：创建成本高。为了解决这个缺点，Java并发包里提供了线程池等工具类。这个思路在很长一段时间里都是很稳妥的方案，但是这个方案并不是唯一的方案。
+
+**轻量级线程**。Go语言、Lua语言里的协程，本质上就是一种轻量级的线程。轻量级的线程，创建的成本很低，基本上和创建一个普通对象的成本相似；并且创建的速度和内存占用相比操作系统线程至少有一个数量级的提升，所以基于轻量级线程实现Thread-Per-Message模式就完全没有问题了。
+
+## Fiber实现
+
+Java中有个项目，轻量级线程被叫做**Fiber**
+
+```java
+final ServerSocketChannel ssc = 
+  ServerSocketChannel.open().bind(
+    new InetSocketAddress(8080));
+//处理请求
+try{
+  while (true) {
+    // 接收请求
+    final SocketChannel sc = 
+      ssc.accept();
+    Fiber.schedule(()->{
+      try {
+        // 读Socket
+        ByteBuffer rb = ByteBuffer
+          .allocateDirect(1024);
+        sc.read(rb);
+        //模拟处理请求
+        LockSupport.parkNanos(2000*1000000);
+        // 写Socket
+        ByteBuffer wb = 
+          (ByteBuffer)rb.flip()
+        sc.write(wb);
+        // 关闭Socket
+        sc.close();
+      } catch(Exception e){
+        throw new UncheckedIOException(e);
+      }
+    });
+  }//while
+}finally{
+  ssc.close();
+}
+```
+
+1. 首先通过 `ulimit -u 512` 将用户能创建的最大进程数（包括线程）设置为512；
+2. 启动Fiber实现的echo程序；
+3. 利用压测工具ab进行压测：ab -r -c 20000 -n 200000 [http://测试机IP地址:8080/](http://xn--ip-im8ckc884ihkivx9c:8080/)
+
+```
+Concurrency Level:      20000
+Time taken for tests:   67.718 seconds
+Complete requests:      200000
+Failed requests:        0
+Write errors:           0
+Non-2xx responses:      200000
+Total transferred:      16400000 bytes
+HTML transferred:       0 bytes
+Requests per second:    2953.41 [#/sec] (mean)
+Time per request:       6771.844 [ms] (mean)
+Time per request:       0.339 [ms] (mean, across all concurrent requests)
+Transfer rate:          236.50 [Kbytes/sec] received
+
+Connection Times (ms)
+              min  mean[+/-sd] median   max
+Connect:        0  557 3541.6      1   63127
+Processing:  2000 2010  31.8   2003    2615
+Waiting:     1986 2008  30.9   2002    2615
+Total:       2000 2567 3543.9   2004   65293
+```
+
+即便在20000并发下，该程序依然能够良好运行。同等条件下，Thread实现的echo程序512并发都抗不过去，直接就OOM了。
+
+`top -Hp pid` 查看Fiber实现的echo程序的进程信息，你可以看到该进程仅仅创建了16（不同CPU核数结果会不同）个操作系统线程。
+
+## 总结
+
+Java中Thread-Per-Message方案由于线程是重量级对象，所以没有那么流行；
+
+对于并发度没有那么高的异步场景，比如定时任务，用Thread-Per-Message就是完全没有问题的。

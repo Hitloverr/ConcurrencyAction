@@ -3878,3 +3878,163 @@ System.out.println("end");
 最简单粗暴的办法就是将线程池的最大线程数调大，如果能够确定任务的数量不是非常多的话，这个办法也是可行的，否则这个办法就行不通了。其实**这种问题通用的解决方案是为不同的任务创建不同的线程池**。对于上面的这个应用，L1阶段的任务和L2阶段的任务如果各自都有自己的线程池，就不会出现这种问题了。
 
 最后再次强调一下：**提交到相同线程池中的任务一定是相互独立的，否则就一定要慎重**。
+
+# 两阶段终止模式：优雅终止线程
+
+“优雅地终止线程”，不是自己终止自己，而是在一个线程T1中，终止线程T2；这里所谓的“优雅”，指的是给T2一个机会料理后事，而不是被一剑封喉。
+
+## 如何理解？
+
+第一个阶段主要是线程T1向线程T2**发送终止指令**，而第二阶段则是线程T2**响应终止指令**
+
+![image-20250424205908867](image\image-20250424205908867.png)
+
+Java线程进入终止状态的前提是线程进入RUNNABLE状态，而实际上线程也可能处在休眠状态，也就是说，我们要想终止一个线程，首先要把线程的状态从休眠状态转换到RUNNABLE状态。如何做到呢？这个要靠Java Thread类提供的**interrupt()方法**，它可以将休眠状态的线程转换到RUNNABLE状态。
+
+优雅的方式是让Java线程自己执行完 run() 方法，所以一般我们采用的方法是**设置一个标志位**，然后线程会在合适的时机检查这个标志位，如果发现符合终止条件，则自动退出run()方法。这个过程其实就是我们前面提到的第二阶段：**响应终止指令**。
+
+
+
+**interrupt()方法**和**线程终止的标志位**。
+
+## 用两阶段终止模式终止监控操作
+
+![image-20250424210039032](image\image-20250424210039032.png)
+
+出于对性能的考虑（有些监控项对系统性能影响很大，所以不能一直持续监控），动态采集功能一般都会有终止操作。
+
+```java
+class Proxy {
+  boolean started = false;
+  //采集线程
+  Thread rptThread;
+  //启动采集功能
+  synchronized void start(){
+    //不允许同时启动多个采集线程
+    if (started) {
+      return;
+    }
+    started = true;
+    rptThread = new Thread(()->{
+      while (true) {
+        //省略采集、回传实现
+        report();
+        //每隔两秒钟采集、回传一次数据
+        try {
+          Thread.sleep(2000);
+        } catch (InterruptedException e) {  
+        }
+      }
+      //执行到此处说明线程马上终止
+      started = false;
+    });
+    rptThread.start();
+  }
+  //终止采集功能
+  synchronized void stop(){
+    //如何实现？
+  }
+}  
+```
+
+需要注意的是，我们在捕获Thread.sleep()的中断异常之后，通过 `Thread.currentThread().interrupt()` 重新设置了线程的中断状态，因为JVM的异常处理会清除线程的中断状态。
+
+```java
+class Proxy {
+  boolean started = false;
+  //采集线程
+  Thread rptThread;
+  //启动采集功能
+  synchronized void start(){
+    //不允许同时启动多个采集线程
+    if (started) {
+      return;
+    }
+    started = true;
+    rptThread = new Thread(()->{
+      while (!Thread.currentThread().isInterrupted()){
+        //省略采集、回传实现
+        report();
+        //每隔两秒钟采集、回传一次数据
+        try {
+          Thread.sleep(2000);
+        } catch (InterruptedException e){
+          //重新设置线程中断状态
+          Thread.currentThread().interrupt();
+        }
+      }
+      //执行到此处说明线程马上终止
+      started = false;
+    });
+    rptThread.start();
+  }
+  //终止采集功能
+  synchronized void stop(){
+    rptThread.interrupt();
+  }
+}
+```
+
+
+
+
+
+我们很可能在线程的run()方法中调用第三方类库提供的方法，而我们没有办法保证第三方类库正确处理了线程的中断异常，例如第三方类库在捕获到Thread.sleep()方法抛出的中断异常后，没有重新设置线程的中断状态，那么就会导致线程不能够正常终止。所以强烈建议你**设置自己的线程终止标志位**
+
+```java
+class Proxy {
+  //线程终止标志位
+  volatile boolean terminated = false;
+  boolean started = false;
+  //采集线程
+  Thread rptThread;
+  //启动采集功能
+  synchronized void start(){
+    //不允许同时启动多个采集线程
+    if (started) {
+      return;
+    }
+    started = true;
+    terminated = false;
+    rptThread = new Thread(()->{
+      while (!terminated){
+        //省略采集、回传实现
+        report();
+        //每隔两秒钟采集、回传一次数据
+        try {
+          Thread.sleep(2000);
+        } catch (InterruptedException e){
+          //重新设置线程中断状态
+          Thread.currentThread().interrupt();
+        }
+      }
+      //执行到此处说明线程马上终止
+      started = false;
+    });
+    rptThread.start();
+  }
+  //终止采集功能
+  synchronized void stop(){
+    //设置中断标志位
+    terminated = true;
+    //中断线程rptThread
+    rptThread.interrupt();
+  }
+}
+```
+
+
+
+## 优雅终止线程池
+
+shutdown()方法是一种很保守的关闭线程池的方法。线程池执行shutdown()后，就会拒绝接收新的任务，但是会等待线程池中正在执行的任务和已经进入阻塞队列的任务都执行完之后才最终关闭线程池。
+
+而shutdownNow()方法，相对就激进一些了，线程池执行shutdownNow()后，会拒绝接收新的任务，同时还会中断线程池中正在执行的任务，已经进入阻塞队列的任务也被剥夺了执行的机会，不过这些被剥夺执行机会的任务会作为shutdownNow()方法的返回值返回。因为shutdownNow()方法会中断正在执行的线程，所以提交到线程池的任务，如果需要优雅地结束，就需要正确地处理线程中断。
+
+如果提交到线程池的任务不允许取消，那就不能使用shutdownNow()方法终止线程池。不过，如果提交到线程池的任务允许后续以补偿的方式重新执行，也是可以使用shutdownNow()方法终止线程池的。提到一种将已提交但尚未开始执行的任务以及已经取消的正在执行的任务保存起来，以便后续重新执行的方案
+
+它们实质上使用的也是两阶段终止模式，只是终止指令的范围不同而已，前者**只影响阻塞队列接收任务**，后者范围**扩大到线程池中所有的任务**。
+
+## 总结
+
+一个是仅检查终止标志位是不够的，因为线程的状态可能处于休眠态；另一个是仅检查线程的中断状态也是不够的，因为我们依赖的第三方类库很可能没有正确处理中断异常

@@ -4038,3 +4038,174 @@ shutdown()方法是一种很保守的关闭线程池的方法。线程池执行s
 ## 总结
 
 一个是仅检查终止标志位是不够的，因为线程的状态可能处于休眠态；另一个是仅检查线程的中断状态也是不够的，因为我们依赖的第三方类库很可能没有正确处理中断异常
+
+
+
+# 生产者消费者模式：流水线思想提高效率
+
+## 优点
+
+生产者线程1、2、3 --> 任务队列 --> 消费者线程1 2 3
+
+架构设计的优点：
+
+1. 解耦：生产者消费者之间的通信只通过任务队列
+2. 异步：平衡生产者和消费者之间的速度差异
+
+## 支持批量执行以提升性能
+
+轻量级线程是链价的话，那么生产者消费者模式是否没用了呢？
+
+1. 1000个线程insert一条数据
+2. 1个线程批量insert1000条线程。
+
+第2种好。
+
+
+
+有一个例子：怎么做到回传数据批量插入到数据库中？
+
+![image-20250426171140084](image\image-20250426171140084.png)
+
+利用生产者-消费者模式实现批量执行SQL非常简单：将原来直接INSERT数据到数据库的线程作为生产者线程，生产者线程只需将数据添加到任务队列，然后消费者线程负责将任务从任务队列中批量取出并批量执行。
+
+```java
+//任务队列
+BlockingQueue<Task> bq=new
+  LinkedBlockingQueue<>(2000);
+//启动5个消费者线程
+//执行批量任务  
+void start() {
+  ExecutorService es=executors
+    .newFixedThreadPool(5);
+    
+  for (int i=0; i<5; i++) {
+    es.execute(()->{
+      try {
+        while (true) {
+          //获取批量任务
+          List<Task> ts=pollTasks();
+          //执行批量任务
+          execTasks(ts);
+        }
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
+    });
+  }
+}
+//从任务队列中获取批量任务
+List<Task> pollTasks() 
+    throws InterruptedException{
+  List<Task> ts=new LinkedList<>();
+  //阻塞式获取一条任务
+  Task t = bq.take();
+  while (t != null) {
+    ts.add(t);
+    //非阻塞式获取一条任务
+    t = bq.poll();
+  }
+  return ts;
+}
+//批量执行任务
+execTasks(List<Task> ts) {
+  //省略具体代码无数
+}
+```
+
+5个消费者线程以 `while(true){}` 循环方式批量地获取任务并批量地执行。需要注意的是，从任务队列中获取批量任务的方法pollTasks()中，首先是以阻塞方式获取任务队列中的一条任务，而后则是以非阻塞的方式获取任务；之所以首先采用阻塞方式，是因为如果任务队列中没有任务，这样的方式能够避免无谓的循环。
+
+
+
+## 支持分阶段提交以提升性能
+
+写文件如果同步刷盘性能会很慢，所以对于不是很重要的数据，我们往往采用异步刷盘的方式。我曾经参与过一个项目，其中的日志组件是自己实现的，采用的就是异步刷盘方式，刷盘的时机是：
+
+1. ERROR级别的日志需要立即刷盘；
+2. 数据积累到500条需要立即刷盘；
+3. 存在未刷盘数据，且5秒钟内未曾刷盘，需要立即刷盘。
+
+调用 `info()`和`error()` 方法写入日志，这两个方法都是创建了一个日志任务LogMsg，并添加到阻塞队列中，调用 `info()`和`error()` 方法的线程是生产者；而真正将日志写入文件的是消费者线程，在Logger这个类中，我们只创建了1个消费者线程，在这个消费者线程中，会根据刷盘规则执行刷盘操作
+
+```java
+class Logger {
+  //任务队列  
+  final BlockingQueue<LogMsg> bq
+    = new BlockingQueue<>();
+  //flush批量  
+  static final int batchSize=500;
+  //只需要一个线程写日志
+  ExecutorService es = 
+    Executors.newFixedThreadPool(1);
+  //启动写日志线程
+  void start(){
+    File file=File.createTempFile(
+      "foo", ".log");
+    final FileWriter writer=
+      new FileWriter(file);
+    this.es.execute(()->{
+      try {
+        //未刷盘日志数量
+        int curIdx = 0;
+        long preFT=System.currentTimeMillis();
+        while (true) {
+          LogMsg log = bq.poll(
+            5, TimeUnit.SECONDS);
+          //写日志
+          if (log != null) {
+            writer.write(log.toString());
+            ++curIdx;
+          }
+          //如果不存在未刷盘数据，则无需刷盘
+          if (curIdx <= 0) {
+            continue;
+          }
+          //根据规则刷盘
+          if (log!=null && log.level==LEVEL.ERROR ||
+              curIdx == batchSize ||
+              System.currentTimeMillis()-preFT>5000){
+            writer.flush();
+            curIdx = 0;
+            preFT=System.currentTimeMillis();
+          }
+        }
+      }catch(Exception e){
+        e.printStackTrace();
+      } finally {
+        try {
+          writer.flush();
+          writer.close();
+        }catch(IOException e){
+          e.printStackTrace();
+        }
+      }
+    });  
+  }
+  //写INFO级别日志
+  void info(String msg) {
+    bq.put(new LogMsg(
+      LEVEL.INFO, msg));
+  }
+  //写ERROR级别日志
+  void error(String msg) {
+    bq.put(new LogMsg(
+      LEVEL.ERROR, msg));
+  }
+}
+//日志级别
+enum LEVEL {
+  INFO, ERROR
+}
+class LogMsg {
+  LEVEL level;
+  String msg;
+  //省略构造函数实现
+  LogMsg(LEVEL lvl, String msg){}
+  //省略toString()实现
+  String toString(){}
+}
+```
+
+## 总结
+
+MQ一般都会支持两种消息模型，一种是点对点模型，一种是发布订阅模型。这两种模型的区别在于，点对点模型里一个消息只会被一个消费者消费，和Java的线程池非常类似（Java线程池的任务也只会被一个线程执行）；而发布订阅模型里一个消息会被多个消费者消费，本质上是一种消息的广播，在多线程编程领域，你可以结合观察者模式实现广播功能。

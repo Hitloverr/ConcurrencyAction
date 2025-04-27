@@ -4230,4 +4230,322 @@ MQ一般都会支持两种消息模型，一种是点对点模型，一种是发
 
 
 
- 
+ # 案例一：Guava RateLimiter
+
+在向线程池提交任务之前，调用 `acquire()` 方法就能起到限流的作用。通过示例代码的执行结果，任务提交到线程池的时间间隔基本上稳定在500毫秒
+
+```java
+//限流器流速：2个请求/秒
+RateLimiter limiter = 
+  RateLimiter.create(2.0);
+//执行任务的线程池
+ExecutorService es = Executors
+  .newFixedThreadPool(1);
+//记录上一次执行时间
+prev = System.nanoTime();
+//测试执行20次
+for (int i=0; i<20; i++){
+  //限流器限流
+  limiter.acquire();
+  //提交任务异步执行
+  es.execute(()->{
+    long cur=System.nanoTime();
+    //打印时间间隔：毫秒
+    System.out.println(
+      (cur-prev)/1000_000);
+    prev = cur;
+  });
+}
+
+输出结果：
+...
+500
+499
+499
+500
+499
+```
+
+## 令牌桶算法·
+
+**令牌桶算法**，其**核心是要想通过限流器，必须拿到令牌**
+
+1. 令牌以固定的速率添加到令牌桶中，假设限流的速率是 r/秒，则令牌每 1/r 秒会添加一个；
+2. 假设令牌桶的容量是 b ，如果令牌桶已满，则新的令牌会被丢弃；
+3. 请求能够通过限流器的前提是令牌桶中有令牌。
+
+b 其实是burst的简写，意义是**限流器允许的最大突发流量**。比如b=10，而且令牌桶中的令牌已满，此时限流器允许10个请求同时通过限流器，当然只是突发流量而已，这10个请求会带走10个令牌，所以后续的流量只能按照速率 r 通过限流器。
+
+
+
+你的直觉会告诉你生产者-消费者模式：一个生产者线程定时向阻塞队列中添加令牌，而试图通过限流器的线程则作为消费者线程，只有从阻塞队列中获取到令牌，才允许通过限流器。
+
+
+
+这个算法看上去非常完美，而且实现起来非常简单，如果并发量不大，这个实现并没有什么问题。可实际情况却是使用限流的场景大部分都是高并发场景，而且系统压力已经临近极限了，此时这个实现就有问题了。问题就出在定时器上，在高并发场景下，当系统压力已经临近极限的时候，定时器的精度误差会非常大，同时定时器本身会创建调度线程，也会对系统的性能产生影响。
+
+## Guava如何实现
+
+**记录并动态计算下一令牌发放的时间**。下面我们以一个最简单的场景来介绍该算法的执行过程。假设令牌桶的容量为 b=1，限流速率 r = 1个请求/秒，如下图所示，如果当前令牌桶中没有令牌，下一个令牌的发放时间是在第3秒，而在第2秒的时候有一个线程T1请求令牌，此时该如何处理呢
+
+![image-20250427192220224](image\image-20250427192220224.png)
+
+对于这个请求令牌的线程而言，很显然需要等待1秒，因为1秒以后（第3秒）它就能拿到令牌了。此时需要注意的是，下一个令牌发放的时间也要增加1秒，为什么呢？因为第3秒发放的令牌已经被线程T1预占了
+
+![image-20250427192259592](image\image-20250427192259592.png)
+
+假设T1在预占了第3秒的令牌之后，马上又有一个线程T2请求令牌，如下图所示。
+
+
+
+![image-20250427192332213](image\image-20250427192332213.png)
+
+很显然，由于下一个令牌产生的时间是第4秒，所以线程T2要等待两秒的时间，才能获取到令牌，同时由于T2预占了第4秒的令牌，所以下一令牌产生时间还要增加1秒，完全处理之后，如下图所示
+
+![image-20250427192400936](image\image-20250427192400936.png)
+
+如果线程在**下一令牌产生时间之后**请求令牌会如何呢？假设在线程T1请求令牌之后的5秒，也就是第7秒，线程T3请求令牌
+
+![image-20250427192419746](image\image-20250427192419746.png)
+
+由于在第5秒已经产生了一个令牌，所以此时线程T3可以直接拿到令牌，而无需等待。在第7秒，实际上限流器能够产生3个令牌，第5、6、7秒各产生一个令牌。由于我们假设令牌桶的容量是1，所以第6、7秒产生的令牌就丢弃了，其实等价地你也可以认为是保留的第7秒的令牌，丢弃的第5、6秒的令牌，也就是说第7秒的令牌被线程T3占有了，于是下一令牌的的产生时间应该是第8秒
+
+![image-20250427192555450](image\image-20250427192555450.png)
+
+**只需要记录一个下一令牌产生的时间，并动态更新它，就能够轻松完成限流功能**。我们可以将上面的这个算法代码化，示例代码如下所示，依然假设令牌桶的容量是1。关键是**reserve()方法**，这个方法会为请求令牌的线程预分配令牌，同时返回该线程能够获取令牌的时间。其实现逻辑就是上面提到的：如果线程请求令牌的时间在下一令牌产生时间之后，那么该线程立刻就能够获取令牌；反之，如果请求时间在下一令牌产生时间之前，那么该线程是在下一令牌产生的时间获取令牌。由于此时下一令牌已经被该线程预占，所以下一令牌产生的时间需要加上1秒
+
+```java
+class SimpleLimiter {
+  //下一令牌产生时间
+  long next = System.nanoTime();
+  //发放令牌间隔：纳秒
+  long interval = 1000_000_000;
+  //预占令牌，返回能够获取令牌的时间
+  synchronized long reserve(long now){
+    //请求时间在下一令牌产生时间之后
+    //重新计算下一令牌产生时间
+    if (now > next){
+      //将下一令牌产生时间重置为当前时间
+      next = now;
+    }
+    //能够获取令牌的时间
+    long at=next;
+    //设置下一令牌产生时间
+    next += interval;
+    //返回线程需要等待的时间
+    return Math.max(at, 0L);
+  }
+  //申请令牌
+  void acquire() {
+    //申请令牌时的时间
+    long now = System.nanoTime();
+    //预占令牌
+    long at=reserve(now);
+    long waitTime=max(at-now, 0);
+    //按照条件等待
+    if(waitTime > 0) {
+      try {
+        TimeUnit.NANOSECONDS
+          .sleep(waitTime);
+      }catch(InterruptedException e){
+        e.printStackTrace();
+      }
+    }
+  }
+}
+```
+
+如果令牌桶的容量大于1，又该如何处理呢？按照令牌桶算法，令牌要首先从令牌桶中出，所以我们需要按需计算令牌桶中的数量，当有线程请求令牌时，先从令牌桶中出。具体的代码实现如下所示。我们增加了一个**resync()方法**，在这个方法中，如果线程请求令牌的时间在下一令牌产生时间之后，会重新计算令牌桶中的令牌数，**新产生的令牌的计算公式是：(now-next)/interval**，你可对照上面的示意图来理解。reserve()方法中，则增加了先从令牌桶中出令牌的逻辑，不过需要注意的是，如果令牌是从令牌桶中出的，那么next就无需增加一个 interval 了。
+
+```java
+class SimpleLimiter {
+  //当前令牌桶中的令牌数量
+  long storedPermits = 0;
+  //令牌桶的容量
+  long maxPermits = 3;
+  //下一令牌产生时间
+  long next = System.nanoTime();
+  //发放令牌间隔：纳秒
+  long interval = 1000_000_000;
+
+  //请求时间在下一令牌产生时间之后,则
+  // 1.重新计算令牌桶中的令牌数
+  // 2.将下一个令牌发放时间重置为当前时间
+  void resync(long now) {
+    if (now > next) {
+      //新产生的令牌数
+      long newPermits=(now-next)/interval;
+      //新令牌增加到令牌桶
+      storedPermits=min(maxPermits, 
+        storedPermits + newPermits);
+      //将下一个令牌发放时间重置为当前时间
+      next = now;
+    }
+  }
+  //预占令牌，返回能够获取令牌的时间
+  synchronized long reserve(long now){
+    resync(now);
+    //能够获取令牌的时间
+    long at = next;
+    //令牌桶中能提供的令牌
+    long fb=min(1, storedPermits);
+    //令牌净需求：首先减掉令牌桶中的令牌
+    long nr = 1 - fb;
+    //重新计算下一令牌产生时间
+    next = next + nr*interval;
+    //重新计算令牌桶中的令牌
+    this.storedPermits -= fb;
+    return at;
+  }
+  //申请令牌
+  void acquire() {
+    //申请令牌时的时间
+    long now = System.nanoTime();
+    //预占令牌
+    long at=reserve(now);
+    long waitTime=max(at-now, 0);
+    //按照条件等待
+    if(waitTime > 0) {
+      try {
+        TimeUnit.NANOSECONDS
+          .sleep(waitTime);
+      }catch(InterruptedException e){
+        e.printStackTrace();
+      }
+    }
+  }
+}
+```
+
+## 总结
+
+经典的限流算法有两个，一个是**令牌桶算法（Token Bucket）**，另一个是**漏桶算法（Leaky Bucket）**。令牌桶算法是定时向令牌桶发送令牌，请求能够从令牌桶中拿到令牌，然后才能通过限流器；而漏桶算法里，请求就像水一样注入漏桶，漏桶会按照一定的速率自动将水漏掉，只有漏桶里还能注入水的时候，请求才能通过限流器。令牌桶算法和漏桶算法很像一个硬币的正反面，所以你可以参考令牌桶算法的实现来实现漏桶算法
+
+Guava RateLimiter扩展了标准的令牌桶算法，比如还能支持预热功能。对于按需加载的缓存来说，预热后缓存能支持5万TPS的并发，但是在预热前5万TPS的并发直接就把缓存击垮了，所以如果需要给该缓存限流，限流器也需要支持预热功能，在初始阶段，限制的流速 r 很小，但是动态增长的。预热功能的实现非常复杂，Guava构建了一个积分函数来解决这个问题，如果你感兴趣，可以继续深入研究。
+
+# Netty
+
+线程模型
+
+## 网络编程性能的瓶颈
+
+阻塞式I/O（BIO）。BIO模型里，所有read()操作和write()操作都会阻塞当前线程的，如果客户端已经和服务端建立了一个连接，而迟迟不发送数据，那么服务端的read()操作会一直阻塞，所以**使用BIO模型，一般都会为每个socket分配一个独立的线程**，这样就不会因为线程阻塞在一个socket上而影响对其他socket的读写。每一个socket都对应一个独立的线程；为了避免频繁创建、消耗线程，可以采用线程池，但是socket和线程之间的对应关系并不会变化。
+
+![image-20250427193636217](image\image-20250427193636217.png)
+
+互联网场景中，虽然连接多，但是每个连接上的请求并不频繁，所以线程大部分时间都在等待I/O就绪。也就是说线程大部分时间都阻塞在那里，这完全是浪费。
+
+可以用一个线程来处理多个连接，这样线程的利用率就上来了，同时所需的线程数量也跟着降下来了。这个思路很好，可是使用BIO相关的API是无法实现的，这是为什么呢？因为BIO相关的socket读写操作都是阻塞式的，而一旦调用了阻塞式API，在I/O就绪前，调用线程会一直阻塞，也就无法处理其他的socket连接了
+
+![image-20250427193753033](image\image-20250427193753033.png)
+
+非阻塞式（NIO）API，**利用非阻塞式API就能够实现一个线程处理多个连接了**。那具体如何实现呢？现在普遍都是**采用Reactor模式**
+
+## Reactor模式
+
+Handle指的是I/O句柄，在Java网络编程里，它本质上就是一个网络连接。Event Handler很容易理解，就是一个事件处理器，其中handle_event()方法处理I/O事件，也就是每个Event Handler处理一个I/O Handle；get_handle()方法可以返回这个I/O的Handle。Synchronous Event Demultiplexer可以理解为操作系统提供的I/O多路复用API，例如POSIX标准里的select()以及Linux里面的epoll()。
+
+![image-20250427193853993](image\image-20250427193853993.png)
+
+**Reactor这个类**，其中register_handler()和remove_handler()这两个方法可以注册和删除一个事件处理器；**handle_events()方式是核心**，也是Reactor模式的发动机，这个方法的核心逻辑如下：首先通过同步事件多路选择器提供的select()方法监听网络事件，当有网络事件就绪后，就遍历事件处理器来处理该网络事件。由于网络事件是源源不断的，所以在主程序中启动Reactor模式，需要以 `while(true){}` 的方式调用handle_events()方法。
+
+```java
+void Reactor::handle_events(){
+  //通过同步事件多路选择器提供的
+  //select()方法监听网络事件
+  select(handlers);
+  //处理网络事件
+  for(h in handlers){
+    h.handle_event();
+  }
+}
+// 在主程序中启动事件循环
+while (true) {
+  handle_events();
+```
+
+## Netty
+
+最核心：事件循环EventLoop，也就是Reactor，负责监听网络事件并且调用事件处理器进行处理。
+
+网络连接和EventLoop是多对一的关系，EventLoop和线程是一对一的关系。也就是一个网络连接只对应一个EventLoop，一个EventLoop只对应一个Java线程=> 一个网络连接，只对应一个Java线程。也就是网络连接的事件处理是单线程的，避免了并发问题。
+
+![image-20250427194337453](image\image-20250427194337453.png)
+
+EventLoopGroup：由一组EventLoop组成，一般至少有两个EventLoopGroup，bossGroup workerGroup
+
+
+
+socket处理TCP网络连接请求，是在一个独立的socket中，每当有一个TCP连接成功建立，都会创建一个新的socket，之后对TCP连接的读写都是由新创建处理的socket完成的。也就是说**处理TCP连接请求和读写请求是通过两个不同的socket完成的**
+
+
+
+bossGroup就是用来处理连接请求的，workerGroup是用来处理读写请求。bossGroup处理完连接请求后，会将这个连接提交给workerGroup来处理， workerGroup里面有多个EventLoop，那新的连接会交给哪个EventLoop来处理呢？这就需要一个负载均衡算法，Netty中目前使用的是**轮询算法**。
+
+## 实现示例
+
+第一个，如果NettybossGroup只监听一个端口，那bossGroup只需要1个EventLoop就可以了，多了纯属浪费。
+
+第二个，默认情况下，Netty会创建“2*CPU核数”个EventLoop，由于网络连接与EventLoop有稳定的关系，所以事件处理器在处理网络事件的时候是不能有阻塞操作的，否则很容易导致请求大面积超时。如果实在无法避免使用阻塞操作，那可以通过线程池来异步处理。
+
+```java
+//事件处理器
+final EchoServerHandler serverHandler 
+  = new EchoServerHandler();
+
+//boss线程组  
+EventLoopGroup bossGroup 
+  = new NioEventLoopGroup(1); 
+
+//worker线程组  
+EventLoopGroup workerGroup 
+  = new NioEventLoopGroup();
+
+try {
+  ServerBootstrap b = new ServerBootstrap();
+  b.group(bossGroup, workerGroup)
+   .channel(NioServerSocketChannel.class)
+   .childHandler(new ChannelInitializer<SocketChannel>() {
+     @Override
+     public void initChannel(SocketChannel ch){
+       ch.pipeline().addLast(serverHandler);
+     }
+    });
+  //bind服务端端口  
+  ChannelFuture f = b.bind(9090).sync();
+  f.channel().closeFuture().sync();
+} finally {
+  //终止工作线程组
+  workerGroup.shutdownGracefully();
+  //终止boss线程组
+  bossGroup.shutdownGracefully();
+}
+
+//socket连接处理器
+class EchoServerHandler extends 
+    ChannelInboundHandlerAdapter {
+  //处理读事件  
+  @Override
+  public void channelRead(
+    ChannelHandlerContext ctx, Object msg){
+      ctx.write(msg);
+  }
+  //处理读完成事件
+  @Override
+  public void channelReadComplete(
+    ChannelHandlerContext ctx){
+      ctx.flush();
+  }
+  //处理异常事件
+  @Override
+  public void exceptionCaught(
+    ChannelHandlerContext ctx,  Throwable cause) {
+      cause.printStackTrace();
+      ctx.close();
+  }
+}
+```
+
+## 总结
+
+Netty是一个款优秀的网络编程框架，性能非常好，为了实现高性能的目标，Netty做了很多优化，例如优化了ByteBuffer、支持零拷贝等等，和并发编程相关的就是它的线程模型了。Netty的线程模型设计得很精巧，每个网络连接都关联到了一个线程上，这样做的好处是：对于一个网络连接，读写操作都是单线程执行的，从而避免了并发程序的各种问题。

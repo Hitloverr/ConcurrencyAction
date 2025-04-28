@@ -4549,3 +4549,175 @@ class EchoServerHandler extends
 ## 总结
 
 Netty是一个款优秀的网络编程框架，性能非常好，为了实现高性能的目标，Netty做了很多优化，例如优化了ByteBuffer、支持零拷贝等等，和并发编程相关的就是它的线程模型了。Netty的线程模型设计得很精巧，每个网络连接都关联到了一个线程上，这样做的好处是：对于一个网络连接，读写操作都是单线程执行的，从而避免了并发程序的各种问题。
+
+
+
+# 高性能队列Disruptor
+
+性能更高的有界队列：Disruptor。
+
+**Disruptor是一款高性能的有界内存队列**
+
+1. 内存分配更加合理，使用RingBuffer数据结构，数组元素在初始化时一次性全部创建，提升缓存命中率；对象循环利用，避免频繁GC。
+2. 能够避免伪共享，提升缓存利用率。
+3. 采用无锁算法，避免频繁加锁、解锁的性能消耗。
+4. 支持批量消费，消费者可以无锁方式消费多个消息。
+
+
+
+- 在Disruptor中，生产者生产的对象（也就是消费者消费的对象）称为Event，使用Disruptor必须自定义Event，例如示例代码的自定义Event是LongEvent；
+- 构建Disruptor对象除了要指定队列大小外，还需要传入一个EventFactory，示例代码中传入的是`LongEvent::new`；
+- 消费Disruptor中的Event需要通过handleEventsWith()方法注册一个事件处理器，发布Event则需要通过publishEvent()方法。
+
+```java
+//自定义Event 
+class LongEvent { 
+    private long value; 
+    
+    public void set(long value) {
+        this.value = value;
+	} 
+}
+//指定RingBuffer大小, //必须是2的N次方 
+int bufferSize = 1024;
+
+//构建Disruptor 
+Disruptor disruptor = new Disruptor<>(
+	LongEvent::new,
+	bufferSize,
+	DaemonThreadFactory.INSTANCE);
+//注册事件处理器 
+disruptor.handleEventsWith( (event, sequence, endOfBatch) ->
+
+	System.out.println("E: "+event));
+	//启动Disruptor 
+	disruptor.start();
+//获取RingBuffer 
+	RingBuffer ringBuffer = disruptor.getRingBuffer(); 
+//生产Event 
+	ByteBuffer bb = ByteBuffer.allocate(8); 
+	for (long l = 0; true; l++){ bb.putLong(0, l); 
+                                //生产者生产消息 
+    ringBuffer.publishEvent(
+    (event, sequence, buffer) -> 
+      event.set(buffer.getLong(0)), bb);
+    Thread.sleep(1000); }
+}
+```
+
+## RingBuffer如何提升性能
+
+ArrayBlockingQueue使用**数组**作为底层的数据存储，而Disruptor是使用**RingBuffer**作为数据存储
+
+**程序的局部性原理指的是在一段时间内程序的执行会限定在一个局部范围内**。这里的“局部性”可以从两个方面来理解，一个是时间局部性，另一个是空间局部性。**时间局部性**指的是程序中的某条指令一旦被执行，不久之后这条指令很可能再次被执行；如果某条数据被访问，不久之后这条数据很可能再次被访问。而**空间局部性**是指某块内存一旦被访问，不久之后这块内存附近的内存也很可能被访问。
+
+CPU从内存中加载数据X时，会将数据X缓存在高速缓存Cache中，实际上CPU缓存X的同时，还缓存了X周围的数据。
+
+ArrayBlockingQueue。生产者线程向ArrayBlockingQueue增加一个元素，每次增加元素E之前，都需要创建一个对象E，如下图所示，ArrayBlockingQueue内部有6个元素，这6个元素都是由生产者线程创建的，由于创建这些元素的时间基本上是离散的，所以这些元素的内存地址大概率也不是连续的
+
+![image-20250428193731895](image\image-20250428193731895.png)
+
+Disruptor内部的RingBuffer也是用数组实现的，但是这个数组中的所有元素在初始化时是一次性全部创建的，所以这些元素的内存地址大概率是连续的
+
+```java
+for (int i=0; i<bufferSize; i++){
+  //entries[]就是RingBuffer内部的数组
+  //eventFactory就是前面示例代码中传入的LongEvent::new
+  entries[BUFFER_PAD + i] 
+    = eventFactory.newInstance();
+}
+```
+
+数组中所有元素内存地址连续能提升性能吗？能！为什么呢？因为消费者线程在消费的时候，是遵循空间局部性原理的，消费完第1个元素，很快就会消费第2个元素；当消费第1个元素E1的时候，CPU会把内存中E1后面的数据也加载进Cache，如果E1和E2在内存中的地址是连续的，那么E2也就会被加载进Cache中，然后当消费第2个元素的时候，由于E2已经在Cache中了，所以就不需要从内存中加载了，这样就能大大提升性能
+
+![image-20250428193827343](image\image-20250428193827343.png)
+
+在Disruptor中，生产者线程通过publishEvent()发布Event的时候，并不是创建一个新的Event，而是通过event.set()方法修改Event， 也就是说RingBuffer创建的Event是可以循环利用的，这样还能避免频繁创建、删除Event导致的频繁GC问题。
+
+## 避免伪共享
+
+伪共享和CPU内部的Cache有关，Cache内部是按照缓存行（Cache Line）管理的，缓存行的大小通常是64个字节；CPU从内存中加载数据X，会同时加载X后面（64-size(X)）个字节的数据。
+
+ArrayBlockingQueue，其内部维护了4个成员变量，分别是队列数组items、出队索引takeIndex、入队索引putIndex以及队列中的元素总数count。
+
+```java
+/** 队列数组 */
+final Object[] items;
+/** 出队索引 */
+int takeIndex;
+/** 入队索引 */
+int putIndex;
+/** 队列中元素总数 */
+int count;
+```
+
+当CPU从内存中加载takeIndex的时候，会同时将putIndex以及count都加载进Cache。下图是某个时刻CPU中Cache的状况，为了简化，缓存行中我们仅列出了takeIndex和putIndex。
+
+![image-20250428193937031](image\image-20250428193937031.png)
+
+假设线程A运行在CPU-1上，执行入队操作，入队操作会修改putIndex，而修改putIndex会导致其所在的所有核上的缓存行均失效；此时假设运行在CPU-2上的线程执行出队操作，出队操作需要读取takeIndex，由于takeIndex所在的缓存行已经失效，所以CPU-2必须从内存中重新读取。入队操作本不会修改takeIndex，但是由于takeIndex和putIndex共享的是一个缓存行，就导致出队操作不能很好地利用Cache，这其实就是**伪共享**。简单来讲，**伪共享指的是由于共享缓存行导致缓存无效的场景**。
+
+ArrayBlockingQueue的入队和出队操作是用锁来保证互斥的，所以入队和出队不会同时发生。如果允许入队和出队同时发生，那就会导致线程A和线程B争用同一个缓存行，这样也会导致性能问题。所以为了更好地利用缓存，我们必须避免伪共享.
+
+方案很简单，**每个变量独占一个缓存行、不共享缓存行**就可以了，具体技术是**缓存行填充**。比如想让takeIndex独占一个缓存行，可以在takeIndex的前后各填充56个字节，这样就一定能保证takeIndex独占一个缓存行。下面的示例代码出自Disruptor，Sequence 对象中的value属性就能避免伪共享，因为这个属性前后都填充了56个字节。Disruptor中很多对象，例如RingBuffer、RingBuffer内部的数组都用到了这种填充技术来避免伪共享。
+
+```java
+//前：填充56字节
+class LhsPadding{
+    long p1, p2, p3, p4, p5, p6, p7;
+}
+class Value extends LhsPadding{
+    volatile long value;
+}
+//后：填充56字节
+class RhsPadding extends Value{
+    long p9, p10, p11, p12, p13, p14, p15;
+}
+class Sequence extends RhsPadding{
+  //省略实现
+}
+```
+
+## Disruptor中的无锁算法
+
+Disruptor采用的是无锁算法，很复杂，但是核心无非是生产和消费两个操作。Disruptor中最复杂的是入队操作，所以我们重点来看看入队操作是如何实现的。
+
+对于入队操作，最关键的要求是不能覆盖没有消费的元素；对于出队操作，最关键的要求是不能读取没有写入的元素，所以Disruptor中也一定会维护类似出队索引和入队索引这样两个关键变量。Disruptor中的RingBuffer维护了入队索引，但是并没有维护出队索引，这是因为在Disruptor中多个消费者可以同时消费，每个消费者都会有一个出队索引，所以RingBuffer的出队索引是所有消费者里面最小的那一个.
+
+
+
+逻辑很简单：如果没有足够的空余位置，就出让CPU使用权，然后重新计算；反之则用CAS设置入队索引。
+
+```java
+//生产者获取n个写入位置
+do {
+  //cursor类似于入队索引，指的是上次生产到这里
+  current = cursor.get();
+  //目标是在生产n个
+  next = current + n;
+  //减掉一个循环
+  long wrapPoint = next - bufferSize;
+  //获取上一次的最小消费位置
+  long cachedGatingSequence = gatingSequenceCache.get();
+  //没有足够的空余位置
+  if (wrapPoint>cachedGatingSequence || cachedGatingSequence>current){
+    //重新计算所有消费者里面的最小值位置
+    long gatingSequence = Util.getMinimumSequence(
+        gatingSequences, current);
+    //仍然没有足够的空余位置，出让CPU使用权，重新执行下一循环
+    if (wrapPoint > gatingSequence){
+      LockSupport.parkNanos(1);
+      continue;
+    }
+    //从新设置上一次的最小消费位置
+    gatingSequenceCache.set(gatingSequence);
+  } else if (cursor.compareAndSet(current, next)){
+    //获取写入位置成功，跳出循环
+    break;
+  }
+} while (true);
+```
+
+## 总结
+
+Java 8中，提供了避免伪共享的注解：@sun.misc.Contended，通过这个注解就能轻松避免伪共享（需要设置JVM参数-XX:-RestrictContended）。不过避免伪共享是以牺牲内存为代价的

@@ -4721,3 +4721,207 @@ do {
 ## 总结
 
 Java 8中，提供了避免伪共享的注解：@sun.misc.Contended，通过这个注解就能轻松避免伪共享（需要设置JVM参数-XX:-RestrictContended）。不过避免伪共享是以牺牲内存为代价的
+
+
+
+# HiKariCP
+
+数据库连接池和线程池一样，都属于池化资源，作用都是避免重量级资源的频繁创建和销毁，对于数据库连接池来说，也就是避免数据库连接频繁创建和销毁。如下图所示，服务端会在运行期持有一定数量的数据库连接，当需要执行SQL时，并不是直接创建一个数据库连接，而是从连接池中获取一个；当SQL执行完，也并不是将数据库连接真的关掉，而是将其归还到连接池中
+
+![image-20250428194311318](image\image-20250428194311318.png)
+
+1. 通过数据源获取一个数据库连接；
+2. 创建Statement；
+3. 执行SQL；
+4. 通过ResultSet获取SQL执行结果；
+5. 释放ResultSet；
+6. 释放Statement；
+7. 释放数据库连接。
+
+`ds.getConnection()` 获取一个数据库连接时，其实是向数据库连接池申请一个数据库连接，而不是创建一个新的数据库连接。同样，通过 `conn.close()` 释放一个数据库连接时，也不是直接将连接关闭，而是将连接归还给数据库连接池。
+
+```java
+//数据库连接池配置
+HikariConfig config = new HikariConfig();
+config.setMinimumIdle(1);
+config.setMaximumPoolSize(2);
+config.setConnectionTestQuery("SELECT 1");
+config.setDataSourceClassName("org.h2.jdbcx.JdbcDataSource");
+config.addDataSourceProperty("url", "jdbc:h2:mem:test");
+// 创建数据源
+DataSource ds = new HikariDataSource(config);
+Connection conn = null;
+Statement stmt = null;
+ResultSet rs = null;
+try {
+  // 获取数据库连接
+  conn = ds.getConnection();
+  // 创建Statement 
+  stmt = conn.createStatement();
+  // 执行SQL
+  rs = stmt.executeQuery("select * from abc");
+  // 获取结果
+  while (rs.next()) {
+    int id = rs.getInt(1);
+    ......
+  }
+} catch(Exception e) {
+   e.printStackTrace();
+} finally {
+  //关闭ResultSet
+  close(rs);
+  //关闭Statement 
+  close(stmt);
+  //关闭Connection
+  close(conn);
+}
+//关闭资源
+void close(AutoCloseable rs) {
+  if (rs != null) {
+    try {
+      rs.close();
+    } catch (SQLException e) {
+      e.printStackTrace();
+    }
+  }
+}
+```
+
+微观上HiKariCP程序编译出的字节码执行效率更高，站在字节码的角度去优化Java代码.宏观上主要是和两个数据结构有关，一个是FastList，另一个是ConcurrentBag
+
+## FastList
+
+最好的办法是当关闭Connection时，能够自动关闭Statement。为了达到这个目标，Connection就需要跟踪创建的Statement，最简单的办法就是将创建的Statement保存在数组ArrayList里，这样当关闭Connection的时候，就可以依次将数组中的所有Statement关闭.
+
+假设一个Connection依次创建6个Statement，分别是S1、S2、S3、S4、S5、S6，按照正常的编码习惯，关闭Statement的顺序一般是逆序的，关闭的顺序是：S6、S5、S4、S3、S2、S1，而ArrayList的remove(Object o)方法是顺序遍历查找，逆序删除而顺序查找，这样的查找效率就太慢了。如何优化呢？很简单，优化成逆序查找就可以了.
+
+HiKariCP中的FastList相对于ArrayList的一个优化点就是将 `remove(Object element)` 方法的**查找顺序变成了逆序查找**。除此之外，FastList还有另一个优化点，是 `get(int index)` 方法没有对index参数进行越界检查，HiKariCP能保证不会越界，所以不用每次都进行越界检查
+
+## ConcurrentBag
+
+实现一个数据库连接池，最简单的办法就是用两个阻塞队列来实现，一个用于保存空闲数据库连接的队列idle，另一个用于保存忙碌数据库连接的队列busy；获取连接时将空闲的数据库连接从idle队列移动到busy队列，而关闭连接时将数据库连接从busy移动到idle。这种方案将并发问题委托给了阻塞队列，实现简单，但是性能并不是很理想。因为Java SDK中的阻塞队列是用锁实现的，而高并发场景下锁的争用对性能影响很大
+
+```java
+//忙碌队列
+BlockingQueue<Connection> busy;
+//空闲队列
+BlockingQueue<Connection> idle;
+```
+
+HiKariCP自己实现了一个叫做ConcurrentBag的并发容器,一个核心设计是使用ThreadLocal避免部分并发问题.
+
+最关键的属性有4个，分别是：用于存储所有的数据库连接的共享队列sharedList、线程本地存储threadList、等待数据库连接的线程数waiters以及分配数据库连接的工具handoffQueue。其中，handoffQueue用的是Java SDK提供的SynchronousQueue，SynchronousQueue主要用于线程之间传递数据。
+
+```java
+//用于存储所有的数据库连接
+CopyOnWriteArrayList<T> sharedList;
+//线程本地存储中的数据库连接
+ThreadLocal<List<Object>> threadList;
+//等待数据库连接的线程数
+AtomicInteger waiters;
+//分配数据库连接的工具
+SynchronousQueue<T> handoffQueue;
+```
+
+线程池创建了一个数据库连接时，通过调用ConcurrentBag的add()方法加入到ConcurrentBag中，下面是add()方法的具体实现，逻辑很简单，就是将这个连接加入到共享队列sharedList中，如果此时有线程在等待数据库连接，那么就通过handoffQueue将这个连接分配给等待的线程
+
+```java
+//将空闲连接添加到队列
+void add(final T bagEntry){
+  //加入共享队列
+  sharedList.add(bagEntry);
+  //如果有等待连接的线程，
+  //则通过handoffQueue直接分配给等待的线程
+  while (waiters.get() > 0 
+    && bagEntry.getState() == STATE_NOT_IN_USE 
+    && !handoffQueue.offer(bagEntry)) {
+      yield();
+  }
+}
+```
+
+ConcurrentBag提供的borrow()方法，可以获取一个空闲的数据库连接，borrow()的主要逻辑是：
+
+1. 首先查看线程本地存储是否有空闲连接，如果有，则返回一个空闲的连接；
+2. 如果线程本地存储中无空闲连接，则从共享队列中获取。
+3. 如果共享队列中也没有空闲的连接，则请求线程需要等待
+
+线程本地存储中的连接是可以被其他线程窃取的，所以需要用CAS方法防止重复分配。在共享队列中获取空闲连接，也采用了CAS方法防止重复分配。
+
+```java
+T borrow(long timeout, final TimeUnit timeUnit){
+  // 先查看线程本地存储是否有空闲连接
+  final List<Object> list = threadList.get();
+  for (int i = list.size() - 1; i >= 0; i--) {
+    final Object entry = list.remove(i);
+    final T bagEntry = weakThreadLocals 
+      ? ((WeakReference<T>) entry).get() 
+      : (T) entry;
+    //线程本地存储中的连接也可以被窃取，
+    //所以需要用CAS方法防止重复分配
+    if (bagEntry != null 
+      && bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+      return bagEntry;
+    }
+  }
+
+  // 线程本地存储中无空闲连接，则从共享队列中获取
+  final int waiting = waiters.incrementAndGet();
+  try {
+    for (T bagEntry : sharedList) {
+      //如果共享队列中有空闲连接，则返回
+      if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+        return bagEntry;
+      }
+    }
+    //共享队列中没有连接，则需要等待
+    timeout = timeUnit.toNanos(timeout);
+    do {
+      final long start = currentTime();
+      final T bagEntry = handoffQueue.poll(timeout, NANOSECONDS);
+      if (bagEntry == null 
+        || bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+          return bagEntry;
+      }
+      //重新计算等待时间
+      timeout -= elapsedNanos(start);
+    } while (timeout > 10_000);
+    //超时没有获取到连接，返回null
+    return null;
+  } finally {
+    waiters.decrementAndGet();
+  }
+}
+```
+
+释放连接需要调用ConcurrentBag提供的requite()方法，该方法的逻辑很简单，首先将数据库连接状态更改为STATE_NOT_IN_USE，之后查看是否存在等待线程，如果有，则分配给等待线程；如果没有，则将该数据库连接保存到线程本地存储里。
+
+```java
+//释放连接
+void requite(final T bagEntry){
+  //更新连接状态
+  bagEntry.setState(STATE_NOT_IN_USE);
+  //如果有等待的线程，则直接分配给线程，无需进入任何队列
+  for (int i = 0; waiters.get() > 0; i++) {
+    if (bagEntry.getState() != STATE_NOT_IN_USE 
+      || handoffQueue.offer(bagEntry)) {
+        return;
+    } else if ((i & 0xff) == 0xff) {
+      parkNanos(MICROSECONDS.toNanos(10));
+    } else {
+      yield();
+    }
+  }
+  //如果没有等待的线程，则进入线程本地存储
+  final List<Object> threadLocalList = threadList.get();
+  if (threadLocalList.size() < 50) {
+    threadLocalList.add(weakThreadLocals 
+      ? new WeakReference<>(bagEntry) 
+      : bagEntry);
+  }
+}
+```
+
+## 总结
+
+FastList适用于逆序删除场景；而ConcurrentBag通过ThreadLocal做一次预分配，避免直接竞争共享资源，非常适合池化资源的分配。
